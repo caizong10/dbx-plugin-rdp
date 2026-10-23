@@ -37,8 +37,10 @@ jobs:
             target: windows-x64
           - os: ubuntu-latest
             target: linux-x64
-          # macos-13 is the last Intel runner; macos-14 is Apple Silicon.
-          - os: macos-13
+          # macos-15-intel is GitHub's current Intel runner label; the older
+          # macos-13 image is being retired and its jobs can sit queued
+          # indefinitely. macos-14 is Apple Silicon.
+          - os: macos-15-intel
             target: darwin-x64
           - os: macos-14
             target: darwin-arm64
