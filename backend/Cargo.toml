@@ -1,0 +1,46 @@
+[package]
+name = "dbx-plugin-dbx-plugin-rdp"
+version = "0.2.3"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace]
+
+[lib]
+name = "dbx_plugin_rdp"
+path = "src/lib.rs"
+
+[dependencies]
+# Vendored from @dbx-app/plugin-cli sdk-root (crates.io does not publish this SDK).
+dbx-plugin-sdk = { path = "vendor/dbx-plugin-sdk" }
+serde_json = "1"
+
+# IronRDP stack (Devolutions, pure Rust RDP). Versions and feature choices
+# verified against docs.rs/crates.io on 2026-10-20. rustls uses the ring
+# provider so the build needs no NASM/CMake; connector re-exports sspi with
+# the network_client module ungated.
+ironrdp-connector = "0.10"
+ironrdp-session = "0.11"
+ironrdp-blocking = "0.10"
+ironrdp-graphics = "0.9"
+# DisplayControl DVC for dynamic resize (both are already pulled in by
+# ironrdp-session; naming them here lets the engine attach the channel).
+ironrdp-displaycontrol = "0.8"
+ironrdp-dvc = "0.8"
+ironrdp-core = "0.2"
+ironrdp-cliprdr = "0.7"
+ironrdp-svc = "0.8"
+arboard = { version = "3.7", default-features = false }
+ironrdp-pdu = { version = "0.9", features = ["std"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+x509-cert = "0.2"
+sha2 = "0.10"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Keep plugin binaries close to the host app's size.
+# panic stays "unwind" so the sidecar protocol can report panics as errors.
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

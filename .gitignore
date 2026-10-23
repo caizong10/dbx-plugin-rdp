@@ -1,0 +1,31 @@
+# Build output (never commit installable artifacts; publish them as GitHub
+# Releases instead).
+/dist/
+/release/*.dbxp
+/release/*.artifact.json
+
+# Local development scratch: real connection credentials live here.
+/.dbx-dev/
+/dbx-repository-signing-key.env
+.DS_Store
+*.log
+
+# Per-machine cargo override. The committed reference is
+# `.cargo/config.toml.example`; cargo walks up from the working directory, so
+# one root-level file covers `backend/` builds too.
+/.cargo/config.toml
+
+# dependencies
+/node_modules/
+
+# rust build artifacts
+/target/
+backend/target/
+
+# Rebuildable toolchain shims (source of truth is tools/*.rs)
+tools/*.exe
+tools/shim-bin/
+
+# Sidecar binary is produced by `cargo build --release` and packed by
+# `dbx-plugin package`; only the source tree is tracked.
+bin/windows-x64/*.exe

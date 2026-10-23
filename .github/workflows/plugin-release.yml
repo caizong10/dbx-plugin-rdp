@@ -1,0 +1,116 @@
+name: Plugin release
+
+# Builds the unsigned candidate .dbxp for every native target and attaches it
+# to a GitHub Release. DBX installs these as "unsigned development packages"
+# (enabled via Plugin Center → allow unsigned dev packages); the official
+# Marketplace listing is a separate, maintainer-signed flow via t8y2/dbx-store.
+#
+# Tag a version to publish:  git tag v0.2.3 && git push origin v0.2.3
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: windows-x64
+            binary: dbx-plugin-dbx-plugin-rdp.exe
+          # Add linux-x64 / macos-arm64 here once the sidecar is verified there.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type-check and test UI
+        run: |
+          npm run typecheck
+          npm test
+
+      - name: Test backend
+        working-directory: backend
+        run: cargo test --release
+
+      - name: Build UI
+        run: npm run build
+
+      - name: Build sidecar
+        working-directory: backend
+        run: cargo build --release
+
+      - name: Stage sidecar binary
+        shell: bash
+        run: |
+          mkdir -p "bin/${{ matrix.target }}"
+          # Cargo names the binary after the package; the manifest points at
+          # the same file name, so copy it verbatim.
+          cp "backend/target/release/${{ matrix.binary }}" "bin/${{ matrix.target }}/${{ matrix.binary }}"
+
+      - name: Sync manifest to release version
+        shell: bash
+        run: |
+          # A tag build must ship the tag's version in the manifest.
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            version="${GITHUB_REF#refs/tags/v}"
+            node -e '
+              const fs = require("node:fs");
+              const version = process.argv[1];
+              for (const [file, key] of [["manifest.json", null], ["backend/Cargo.toml", null]]) {
+                let text = fs.readFileSync(file, "utf8");
+                text = file.endsWith(".json")
+                  ? text.replace(/("version":\s*")[^"]+(")/, `$1${version}$2`)
+                  : text.replace(/^version = "[^"]+"/m, `version = "${version}"`);
+                fs.writeFileSync(file, text);
+              }
+            ' "$version"
+          fi
+
+      - name: Refresh Cargo.lock for packaging
+        run: node scripts/relock-for-package.mjs
+
+      - name: Package .dbxp
+        run: npx --yes @dbx-app/plugin-cli package .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbxp-${{ matrix.target }}
+          path: dist/*.dbxp
+          if-no-files-found: error
+
+  release:
+    name: Attach packages to release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.dbxp
+          generate_release_notes: true
+          fail_on_unmatched_files: true

@@ -1,0 +1,24 @@
+{
+  "name": "dbx-plugin-rdp",
+  "private": true,
+  "version": "0.2.3",
+  "description": "RDP remote desktop plugin for DBX, with a Rust (IronRDP) sidecar.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/caizong10/dbx-plugin-rdp.git"
+  },
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "build:watch": "node scripts/vite-build.mjs --watch",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "typescript": "^5.6.3",
+    "vite": "^6.0.7",
+    "vitest": "^3.0.5"
+  }
+}

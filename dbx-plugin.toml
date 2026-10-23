@@ -1,0 +1,13 @@
+schema_version = 1
+
+[backend]
+language = "rust"
+directory = "backend"
+binary = "dbx-plugin-dbx-plugin-rdp"
+
+[dev]
+ui_build = ["node", "scripts/vite-build.mjs"]
+ui_watch = ["node", "scripts/vite-build.mjs", "--watch"]
+
+[package]
+include = ["assets", "ui"]

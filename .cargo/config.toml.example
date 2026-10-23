@@ -1,0 +1,46 @@
+# Example cargo config for the DBX plugin build workarounds.
+#
+# Copy this file to `.cargo/config.toml` only if you hit the problems below.
+# The real file is gitignored so the repository never carries absolute paths or
+# one machine's toolchain layout. Cargo walks up from the working directory, so
+# this single root-level file also covers `backend/` builds.
+#
+#   cp .cargo/config.toml.example .cargo/config.toml
+#
+# 1. crates.io reachability / schannel CRL failures in restricted networks.
+#    Remove or replace the [http] and [source.*] sections if unnecessary.
+#
+# 2. `dbx-plugin dev` / `dbx-plugin package` invoke cargo with verbatim
+#    (`\\?\D:\...`) paths, which GNU ld/as/dlltool cannot read. This only
+#    affects the x86_64-pc-windows-gnu toolchain; MSVC needs none of it.
+#
+#    Build the shims once (from the repository root):
+#
+#      rustc -O tools/linker-shim.rs -o tools/linker-shim.exe
+#      rustc -O tools/tool-shim.rs   -o tools/tool-shim.exe
+#      mkdir tools/shim-bin
+#      for %t in (gcc as ar ld dlltool) do copy /y tools\tool-shim.exe tools\shim-bin\%t.exe
+#      set PATH=%CD%\tools\shim-bin;%PATH%
+#
+#    IMPORTANT: cargo resolves `linker` relative to the *invocation* working
+#    directory, not to this file, so a `../tools/...` path breaks whenever
+#    cargo is run from a different directory (it is, during packaging).
+#    Uncomment the linker line below and set DBX_LINKER_SHIM to the absolute
+#    path of tools/linker-shim.exe:
+#
+#      set DBX_LINKER_SHIM=D:\path\to\dbx-plugin-rdp\tools\linker-shim.exe
+#
+#    rustc does not expand environment variables in `linker`, so substitute the
+#    absolute path into the line below by hand.
+
+[http]
+check-revoke = false
+
+[source.crates-io]
+replace-with = "rsproxy-sparse"
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[target.x86_64-pc-windows-gnu]
+# linker = "C:/absolute/path/to/dbx-plugin-rdp/tools/linker-shim.exe"

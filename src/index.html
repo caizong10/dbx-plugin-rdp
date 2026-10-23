@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>RDP Remote Desktop</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main id="app">
+      <header class="bar">
+        <span class="eyebrow" id="eyebrow">DBX RDP Workbench</span>
+        <div class="tools">
+          <label class="pick">
+            <span id="res-label">Resolution</span>
+            <select id="resolution"></select>
+          </label>
+          <label class="pick">
+            <span id="scale-label">Scale</span>
+            <select id="scale">
+              <option value="1">100%</option>
+              <option value="1.25">125%</option>
+              <option value="1.5">150%</option>
+              <option value="1.75">175%</option>
+              <option value="2">200%</option>
+            </select>
+          </label>
+          <button id="apply" class="dbx-btn" type="button">Apply</button>
+        </div>
+      </header>
+      <section class="canvas-wrap">
+        <canvas id="screen" width="1280" height="800" tabindex="0"></canvas>
+        <div class="overlay" id="overlay"></div>
+        <div class="reconnect" id="reconnect" hidden>
+          <span class="reconnect-note">Connection lost</span>
+          <button id="retry" class="dbx-btn" type="button">Retry now</button>
+        </div>
+      </section>
+      <textarea id="ime" class="ime" spellcheck="false" aria-hidden="true"></textarea>
+    </main>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

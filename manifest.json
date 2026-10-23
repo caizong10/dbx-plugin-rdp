@@ -1,0 +1,141 @@
+{
+  "$schema": "https://raw.githubusercontent.com/t8y2/dbx/main/plugins/manifest.schema.json",
+  "manifest_version": 1,
+  "id": "io.github.caizong10.rdp",
+  "name": "RDP Remote Desktop",
+  "version": "0.2.3",
+  "publisher": "caizong10",
+  "description": "RDP remote desktop connections inside DBX, powered by a Rust (IronRDP) sidecar.",
+  "icon": "assets/plugin.svg",
+  "source": "https://github.com/caizong10/dbx-plugin-rdp",
+  "homepage": "https://github.com/caizong10/dbx-plugin-rdp",
+  "engines": {
+    "dbx": ">=0.5.68",
+    "host_api": "1.4.0"
+  },
+  "permissions": [
+    "host.workbench",
+    "host.events",
+    "host.binary"
+  ],
+  "entrypoints": {
+    "backend": {
+      "protocol_versions": [1],
+      "transport": "stdio-framed",
+      "executable": "bin/windows-x64/dbx-plugin-dbx-plugin-rdp.exe"
+    },
+    "ui": {
+      "root": "ui",
+      "entry": "ui/index.html"
+    }
+  },
+  "contributions": [
+    {
+      "type": "connection-provider",
+      "id": "io.github.caizong10.rdp.connection",
+      "label": "RDP Remote Desktop",
+      "icon": "assets/plugin.svg",
+      "database_type": "rdp",
+      "description": "Connect to a Windows remote desktop over RDP.",
+      "fields": [
+        { "key": "display_name", "label": "Connection name", "type": "text", "default": "RDP connection", "binding": "name", "required": true },
+        { "key": "host", "label": "Host", "type": "text", "binding": "host", "required": true },
+        { "key": "port", "label": "Port", "type": "number", "default": 3389, "binding": "port", "required": true },
+        { "key": "username", "label": "Username", "type": "text", "binding": "username", "required": true },
+        { "key": "password", "label": "Password", "type": "password", "binding": "secret", "required": true },
+        { "key": "domain", "label": "Domain", "type": "text", "binding": "config" },
+        {
+          "key": "color_depth",
+          "label": "Color depth",
+          "type": "select",
+          "default": "16",
+          "options": [
+            { "label": "High Color (16-bit)", "value": "16" },
+            { "label": "True Color (24-bit)", "value": "24" },
+            { "label": "True Color (32-bit)", "value": "32" }
+          ],
+          "binding": "config"
+        },
+        {
+          "key": "resize_mode",
+          "label": "Resolution mode",
+          "type": "select",
+          "default": "dynamic",
+          "options": [
+            { "label": "Dynamic (resize with window)", "value": "dynamic" },
+            { "label": "Fixed size", "value": "fixed" }
+          ],
+          "binding": "config"
+        },
+        { "key": "width", "label": "Width (px)", "type": "number", "default": 1280, "binding": "config", "visible_when": { "field": "resize_mode", "one_of": ["fixed"] } },
+        { "key": "height", "label": "Height (px)", "type": "number", "default": 800, "binding": "config", "visible_when": { "field": "resize_mode", "one_of": ["fixed"] } },
+        { "key": "ignore_cert", "label": "Ignore certificate errors", "type": "boolean", "default": false, "binding": "config" }
+      ],
+      "workbench": "io.github.caizong10.rdp.workbench",
+      "capabilities": ["test", "connect", "disconnect"]
+    },
+    {
+      "type": "workbench",
+      "id": "io.github.caizong10.rdp.workbench",
+      "label": "RDP Remote Desktop Workbench",
+      "description": "Remote desktop canvas for the active RDP connection.",
+      "icon": "assets/plugin.svg"
+    }
+  ],
+  "localizations": {
+    "zh-CN": {
+      "name": "RDP 远程桌面",
+      "description": "在 DBX 中通过 Rust（IronRDP）Sidecar 连接 Windows 远程桌面。",
+      "contributions": {
+        "io.github.caizong10.rdp.connection": {
+          "label": "RDP 远程桌面",
+          "description": "通过 RDP 协议连接 Windows 远程桌面。",
+          "fields": {
+            "display_name": { "label": "连接名称" },
+            "host": { "label": "主机" },
+            "port": { "label": "端口" },
+            "username": { "label": "用户名" },
+            "password": { "label": "密码" },
+            "domain": { "label": "域" },
+            "color_depth": { "label": "色彩深度" },
+            "resize_mode": { "label": "分辨率模式" },
+            "width": { "label": "宽度（像素）" },
+            "height": { "label": "高度（像素）" },
+            "ignore_cert": { "label": "忽略证书错误" }
+          }
+        },
+        "io.github.caizong10.rdp.workbench": {
+          "label": "RDP 远程桌面工作台",
+          "description": "当前 RDP 连接的远程桌面画布。"
+        }
+      }
+    },
+    "en": {
+      "name": "RDP Remote Desktop",
+      "description": "Connect Windows remote desktops inside DBX via a Rust (IronRDP) sidecar.",
+      "contributions": {
+        "io.github.caizong10.rdp.connection": {
+          "label": "RDP Remote Desktop",
+          "description": "Connect to a Windows remote desktop over RDP.",
+          "fields": {
+            "display_name": { "label": "Connection name" },
+            "host": { "label": "Host" },
+            "port": { "label": "Port" },
+            "username": { "label": "Username" },
+            "password": { "label": "Password" },
+            "domain": { "label": "Domain" },
+            "color_depth": { "label": "Color depth" },
+            "resize_mode": { "label": "Resolution mode" },
+            "width": { "label": "Width (px)" },
+            "height": { "label": "Height (px)" },
+            "ignore_cert": { "label": "Ignore certificate errors" }
+          }
+        },
+        "io.github.caizong10.rdp.workbench": {
+          "label": "RDP Remote Desktop Workbench",
+          "description": "Remote desktop canvas for the active RDP connection."
+        }
+      }
+    }
+  }
+}
