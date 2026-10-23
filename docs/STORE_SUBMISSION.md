@@ -77,15 +77,15 @@
     {
       "target": "windows-x64",
       "url": "https://github.com/caizong10/dbx-plugin-rdp/releases/download/v0.2.3/io.github.caizong10.rdp-0.2.3-windows-x64.dbxp",
-      "sha256": "<64 位十六进制，取自 Release 资产>",
-      "size": 0
+      "sha256": "f7635b936c82a1088c6ede847b5c0472d454978139efb79dcd9c176b3464f11e",
+      "size": 3236318
     }
   ]
 }
 ```
 
-`sha256` 与 `size` 必须取自**同一个**未签名 `.dbxp`，可直接从 Release 资产的
-摘要读取：
+上面 `sha256` 与 `size` 已按 `v0.2.3` Release 资产实测填写。如果你重新打了
+tag，必须重取——两者与未签名候选包字节是一一对应的：
 
 ```bash
 sha256sum io.github.caizong10.rdp-0.2.3-windows-x64.dbxp
