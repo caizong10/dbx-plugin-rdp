@@ -84,11 +84,22 @@ jobs:
             ' "$version"
           fi
 
+      # The packager and the lock-refresh step must be the SAME CLI build:
+      # relock records the SDK path the packager will inject. Installing it
+      # locally (rather than npx --yes) also lets relock-for-package.mjs
+      # resolve sdk-root through Node's resolver.
+      - name: Install DBX plugin CLI
+        shell: bash
+        run: |
+          cli_version="$(npm view @dbx-app/plugin-cli version)"
+          npm install --no-save --no-audit --no-fund "@dbx-app/plugin-cli@${cli_version}"
+          echo "DBX_PLUGIN_SDK_ROOT=$GITHUB_WORKSPACE/node_modules/@dbx-app/plugin-cli/sdk-root" >> "$GITHUB_ENV"
+
       - name: Refresh Cargo.lock for packaging
         run: node scripts/relock-for-package.mjs
 
       - name: Package .dbxp
-        run: npx --yes @dbx-app/plugin-cli package .
+        run: npx --no-install dbx-plugin package .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

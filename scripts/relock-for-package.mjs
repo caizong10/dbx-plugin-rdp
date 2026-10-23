@@ -9,19 +9,37 @@
 //
 // Run right before `dbx-plugin package .`:
 //   node scripts/relock-for-package.mjs
-// The sdk-root copy is auto-discovered (project node_modules, then the npx
-// cache); override with DBX_PLUGIN_SDK_ROOT when it lives elsewhere.
+// The sdk-root copy is auto-discovered: DBX_PLUGIN_SDK_ROOT, then the locally
+// installed @dbx-app/plugin-cli package, then npx's cache. Install the CLI
+// first in CI (`npm i -D @dbx-app/plugin-cli` or `npm i -g`) so it is found
+// without network access at this step.
 import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync } from "node:fs";
+import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 
+/** Resolve the installed @dbx-app/plugin-cli directory via Node's resolver. */
+function installedCli() {
+  try {
+    const require = createRequire(join(root, "package.json"));
+    return dirname(require.resolve("@dbx-app/plugin-cli/package.json"));
+  } catch {
+    return null;
+  }
+}
+
 function findSdkRoot() {
   if (process.env.DBX_PLUGIN_SDK_ROOT) return process.env.DBX_PLUGIN_SDK_ROOT;
-  const local = join(root, "node_modules", "@dbx-app", "plugin-cli", "sdk-root");
-  if (existsSync(local)) return local;
+  const candidates = [
+    installedCli() && join(installedCli(), "sdk-root"),
+    join(root, "node_modules", "@dbx-app", "plugin-cli", "sdk-root"),
+  ];
+  for (const candidate of candidates) {
+    if (candidate && existsSync(candidate)) return candidate;
+  }
   // npx keeps package copies under the npm cache (_npx/<hash>/node_modules/…).
   const cache = join(process.env.LOCALAPPDATA ?? "", "npm-cache", "_npx");
   const homeCache = join(process.env.HOME ?? "", ".npm", "_npx");
@@ -32,7 +50,10 @@ function findSdkRoot() {
       if (existsSync(candidate)) return candidate;
     }
   }
-  console.error("sdk-root not found; set DBX_PLUGIN_SDK_ROOT to the @dbx-app/plugin-cli package dir");
+  console.error(
+    "sdk-root not found. Install @dbx-app/plugin-cli (npm i -D @dbx-app/plugin-cli) " +
+      "or set DBX_PLUGIN_SDK_ROOT to the @dbx-app/plugin-cli package dir.",
+  );
   process.exit(2);
 }
 
