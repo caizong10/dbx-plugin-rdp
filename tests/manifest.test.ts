@@ -41,7 +41,12 @@ describe("manifest contract (fact sheet §3/§4)", () => {
     expect(manifest.permissions).toContain("host.events");
     expect(manifest.entrypoints.backend.transport).toBe("stdio-framed");
     expect(manifest.entrypoints.backend.protocol_versions).toEqual([1]);
-    expect(manifest.entrypoints.backend.executable).toMatch(/^bin\/windows-x64\//);
+    // The packager appends the target directory and platform extension itself
+    // (bin/foo -> bin/windows-x64/foo.exe, bin/linux-x64/foo, ...), so the
+    // manifest must stay target-agnostic. A hard-coded bin/<target>/ path
+    // would pin the package to one platform.
+    expect(manifest.entrypoints.backend.executable).toMatch(/^bin\/[^/]+$/);
+    expect(manifest.entrypoints.backend.executable).not.toMatch(/\.exe$/);
   });
 
   it("binds the password field to secret and port to a number", () => {

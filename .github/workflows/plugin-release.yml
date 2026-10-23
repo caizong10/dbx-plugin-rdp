@@ -1,14 +1,23 @@
 name: Plugin release
 
-# Builds the unsigned candidate .dbxp for every native target and attaches it
-# to a GitHub Release. DBX installs these as "unsigned development packages"
-# (enabled via Plugin Center → allow unsigned dev packages); the official
-# Marketplace listing is a separate, maintainer-signed flow via t8y2/dbx-store.
+# Builds the unsigned candidate .dbxp for every supported native target and
+# attaches them to a GitHub Release. DBX installs these as "unsigned
+# development packages" (Plugin Center → allow unsigned dev packages); the
+# official Marketplace listing is a separate, maintainer-signed flow via
+# t8y2/dbx-store.
+#
+# This matrix is also the cross-platform verification: every target runs the
+# Rust and frontend test suites on its own real OS before packaging.
 #
 # Tag a version to publish:  git tag v0.2.3 && git push origin v0.2.3
 
 on:
   push:
+    # Branch pushes run the build + test matrix only; the release job is
+    # guarded by the tag check below. This keeps every platform continuously
+    # verified instead of only at release time.
+    branches:
+      - main
     tags:
       - "v*"
   workflow_dispatch:
@@ -26,8 +35,13 @@ jobs:
         include:
           - os: windows-latest
             target: windows-x64
-            binary: dbx-plugin-dbx-plugin-rdp.exe
-          # Add linux-x64 / macos-arm64 here once the sidecar is verified there.
+          - os: ubuntu-latest
+            target: linux-x64
+          # macos-13 is the last Intel runner; macos-14 is Apple Silicon.
+          - os: macos-13
+            target: darwin-x64
+          - os: macos-14
+            target: darwin-arm64
     steps:
       - uses: actions/checkout@v4
 
@@ -53,28 +67,17 @@ jobs:
       - name: Build UI
         run: npm run build
 
-      - name: Build sidecar
-        working-directory: backend
-        run: cargo build --release
-
-      - name: Stage sidecar binary
-        shell: bash
-        run: |
-          mkdir -p "bin/${{ matrix.target }}"
-          # Cargo names the binary after the package; the manifest points at
-          # the same file name, so copy it verbatim.
-          cp "backend/target/release/${{ matrix.binary }}" "bin/${{ matrix.target }}/${{ matrix.binary }}"
-
       - name: Sync manifest to release version
         shell: bash
         run: |
-          # A tag build must ship the tag's version in the manifest.
+          # A tag build must ship the tag's version in the manifest, otherwise
+          # the store rejects the candidate on identity mismatch.
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             version="${GITHUB_REF#refs/tags/v}"
             node -e '
               const fs = require("node:fs");
               const version = process.argv[1];
-              for (const [file, key] of [["manifest.json", null], ["backend/Cargo.toml", null]]) {
+              for (const file of ["manifest.json", "backend/Cargo.toml"]) {
                 let text = fs.readFileSync(file, "utf8");
                 text = file.endsWith(".json")
                   ? text.replace(/("version":\s*")[^"]+(")/, `$1${version}$2`)
@@ -84,10 +87,9 @@ jobs:
             ' "$version"
           fi
 
-      # The packager and the lock-refresh step must be the SAME CLI build:
-      # relock records the SDK path the packager will inject. Installing it
-      # locally (rather than npx --yes) also lets relock-for-package.mjs
-      # resolve sdk-root through Node's resolver.
+      # `dbx-plugin package` builds the sidecar for the host target, stages it
+      # under bin/<target>/ and rewrites the packaged manifest's executable
+      # path accordingly — no manual copying needed.
       - name: Install DBX plugin CLI
         shell: bash
         run: |
@@ -100,6 +102,33 @@ jobs:
 
       - name: Package .dbxp
         run: npx --no-install dbx-plugin package .
+
+      - name: Verify package
+        shell: bash
+        run: |
+          # Node-only so this works identically on Windows, Linux and macOS.
+          # A package without the native sidecar would be far below 1 MB, so
+          # the size assertion catches a silently missing executable.
+          node -e '
+            const fs = require("node:fs");
+            const files = fs.readdirSync("dist").filter((f) => f.endsWith(".dbxp"));
+            if (files.length !== 1) throw new Error(`expected 1 .dbxp, got ${files.length}`);
+            const file = files[0];
+            const size = fs.statSync(`dist/${file}`).size;
+            const meta = JSON.parse(
+              fs.readFileSync(`dist/${file.replace(/\.dbxp$/, ".artifact.json")}`, "utf8"),
+            );
+            console.log("package:", file);
+            console.log("size:", size, "sha256:", meta.sha256);
+            if (!file.includes(process.env.TARGET)) {
+              throw new Error(`package name does not mention target ${process.env.TARGET}`);
+            }
+            if (size < 1_000_000) {
+              throw new Error(`package is ${size} bytes; the native sidecar is probably missing`);
+            }
+          '
+        env:
+          TARGET: ${{ matrix.target }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

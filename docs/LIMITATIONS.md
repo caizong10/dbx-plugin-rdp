@@ -30,8 +30,14 @@
 
 ## 平台
 
-- 目前只提供 `windows-x64` 构建。Linux/macOS 的 sidecar 尚未验证，因此没有
-  发布对应安装包。
+- 提供 `windows-x64`、`linux-x64`、`darwin-x64`、`darwin-arm64` 四个构建。
+- **验证范围**：四个目标都在 CI 的真实运行器上通过编译、单元测试与打包。
+  但连接真实 Windows 主机的端到端验证目前只在 Windows 上做过；Linux/macOS
+  上的实际会话、剪贴板与输入行为尚未在真机复测，属于「能构建、未实跑」。
+- Linux 剪贴板走 X11（`x11rb`）；纯 Wayland 会话需要 XWayland 才能同步，
+  否则剪贴板功能会静默不可用（连接与画面不受影响）。
+- macOS 未做代码签名/公证，首次运行可能被 Gatekeeper 拦截——Sidecar 由 DBX
+  作为子进程启动，通常不受影响，但未实测。
 
 ## 开发环境差异
 

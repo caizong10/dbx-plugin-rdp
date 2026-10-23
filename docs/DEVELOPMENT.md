@@ -37,8 +37,26 @@ path 依赖，该 patch 永远「未被使用」，cargo 会把这一点记录�
 lock file"；而日常 `cargo build` / `dbx-plugin dev` 又会把它抹掉。所以：日常
 开发保持原样，打包前跑一次 relock 脚本即可。
 
-产物：`dist/io.github.caizong10.rdp-<版本>-windows-x64.dbxp` 及同名
-`.artifact.json`。
+产物：`dist/io.github.caizong10.rdp-<版本>-<target>.dbxp` 及同名
+`.artifact.json`，`<target>` 取决于当前主机（如 `windows-x64`、`linux-x64`、
+`darwin-arm64`）。
+
+打包器会自行构建 sidecar、放到 `bin/<target>/` 下，并把包内 `manifest.json`
+的 `entrypoints.backend.executable` 改写成对应平台路径（Windows 自动补
+`.exe`）。因此**仓库里的 `manifest.json` 必须写成与平台无关的
+`bin/dbx-plugin-dbx-plugin-rdp`**，绝不能写死 `bin/windows-x64/...exe`，
+否则会把包锁死在一个平台上。
+
+## 支持平台
+
+| target | 运行器 | 说明 |
+|---|---|---|
+| `windows-x64` | windows-latest | |
+| `linux-x64` | ubuntu-latest | 剪贴板走 X11（`x11rb`）；Wayland 下依赖 XWayland |
+| `darwin-x64` | macos-13 | Intel |
+| `darwin-arm64` | macos-14 | Apple Silicon |
+
+四个目标都在 CI 里跑完整测试与打包（见下）。
 
 ## 在本地 DBX 里试用
 
@@ -75,22 +93,24 @@ npx @dbx-app/plugin-cli dev --path . --port 5190
 ## 测试
 
 ```bash
-npm test                      # 前端 30 项
+npm test                      # 前端 32 项
 cd backend && cargo test --release   # Rust 25 项
 ```
 
 ## 发布
 
-打 tag 即触发 [`.github/workflows/plugin-release.yml`](../.github/workflows/plugin-release.yml)：
-跑测试 → 构建 UI 与 sidecar → `dbx-plugin package` 生成**未签名候选包** →
-附加到该 tag 的 GitHub Release。
+[`.github/workflows/plugin-release.yml`](../.github/workflows/plugin-release.yml)
+在 `windows-latest` / `ubuntu-latest` / `macos-13` / `macos-14` 四个运行器上
+并行跑：类型检查 → 前后端测试 → 构建 UI 与 sidecar → `dbx-plugin package`
+生成**未签名候选包**。
+
+- 推 `main`：只跑构建与测试（发布 job 被 tag 判断挡住），因此每个平台持续
+  受验证。
+- 推 tag：额外把所有目标的 `.dbxp` 附加到该 tag 的 GitHub Release。
 
 ```bash
 git tag v0.2.3 && git push origin v0.2.3
 ```
-
-工作流目前只在 `windows-latest` 上构建；要覆盖 Linux/macOS 需先在对应平台
-验证 sidecar。
 
 ## Windows + GNU 工具链
 

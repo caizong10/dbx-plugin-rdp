@@ -26,6 +26,6 @@ backend/target/
 tools/*.exe
 tools/shim-bin/
 
-# Sidecar binary is produced by `cargo build --release` and packed by
-# `dbx-plugin package`; only the source tree is tracked.
-bin/windows-x64/*.exe
+# Sidecar binaries are built and staged by `dbx-plugin package` into
+# bin/<target>/; only the source tree is tracked.
+/bin/
