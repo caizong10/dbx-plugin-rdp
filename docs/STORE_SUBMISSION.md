@@ -57,16 +57,16 @@
   "schemaVersion": 1,
   "id": "io.github.caizong10.rdp",
   "publisher": "caizong10",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "name": "RDP Remote Desktop",
   "description": "Open Windows remote desktops inside DBX with a native Rust (IronRDP) sidecar.",
-  "icon": "https://raw.githubusercontent.com/caizong10/dbx-plugin-rdp/v0.2.3/assets/plugin.svg",
+  "icon": "https://raw.githubusercontent.com/caizong10/dbx-plugin-rdp/v0.2.4/assets/plugin.svg",
   "tags": ["rdp", "remote-desktop", "windows"],
   "permissions": ["host.workbench", "host.events", "host.binary"],
-  "source": "https://github.com/caizong10/dbx-plugin-rdp/tree/v0.2.3",
+  "source": "https://github.com/caizong10/dbx-plugin-rdp/tree/v0.2.4",
   "homepage": "https://github.com/caizong10/dbx-plugin-rdp",
   "license": "Apache-2.0",
-  "releaseNotes": "Keyboard shortcuts (Ctrl+C/V/X) now reach the remote desktop, with a corrected PC/AT scan-code table and left/right modifier handling. Text clipboard sync works both ways.",
+  "releaseNotes": "Adds Linux and macOS (Intel + Apple Silicon) builds alongside Windows. Keyboard shortcuts (Ctrl+C/V/X) reach the remote desktop via a corrected PC/AT scan-code table.",
   "localizations": {
     "zh-CN": {
       "name": "RDP 远程桌面",
@@ -76,20 +76,38 @@
   "targets": [
     {
       "target": "windows-x64",
-      "url": "https://github.com/caizong10/dbx-plugin-rdp/releases/download/v0.2.3/io.github.caizong10.rdp-0.2.3-windows-x64.dbxp",
-      "sha256": "f7635b936c82a1088c6ede847b5c0472d454978139efb79dcd9c176b3464f11e",
-      "size": 3236318
+      "url": "https://github.com/caizong10/dbx-plugin-rdp/releases/download/v0.2.4/io.github.caizong10.rdp-0.2.4-windows-x64.dbxp",
+      "sha256": "SHA_WINDOWS_X64",
+      "size": 0
+    },
+    {
+      "target": "linux-x64",
+      "url": "https://github.com/caizong10/dbx-plugin-rdp/releases/download/v0.2.4/io.github.caizong10.rdp-0.2.4-linux-x64.dbxp",
+      "sha256": "SHA_LINUX_X64",
+      "size": 0
+    },
+    {
+      "target": "darwin-x64",
+      "url": "https://github.com/caizong10/dbx-plugin-rdp/releases/download/v0.2.4/io.github.caizong10.rdp-0.2.4-darwin-x64.dbxp",
+      "sha256": "SHA_DARWIN_X64",
+      "size": 0
+    },
+    {
+      "target": "darwin-arm64",
+      "url": "https://github.com/caizong10/dbx-plugin-rdp/releases/download/v0.2.4/io.github.caizong10.rdp-0.2.4-darwin-arm64.dbxp",
+      "sha256": "SHA_DARWIN_ARM64",
+      "size": 0
     }
   ]
 }
 ```
 
-上面 `sha256` 与 `size` 已按 `v0.2.3` Release 资产实测填写。如果你重新打了
-tag，必须重取——两者与未签名候选包字节是一一对应的：
+`sha256` 与 `size` 必须逐个从**同一个**未签名 `.dbxp` 取，不能凭记忆或复用旧
+版本号：
 
 ```bash
-sha256sum io.github.caizong10.rdp-0.2.3-windows-x64.dbxp
-stat -c%s io.github.caizong10.rdp-0.2.3-windows-x64.dbxp
+sha256sum io.github.caizong10.rdp-0.2.4-<target>.dbxp
+stat -c%s io.github.caizong10.rdp-0.2.4-<target>.dbxp
 ```
 
 ## 四、会被直接拒签的硬性约束
@@ -119,9 +137,10 @@ stat -c%s io.github.caizong10.rdp-0.2.3-windows-x64.dbxp
 | 项 | 状态 |
 |---|---|
 | 源码公开 | 已完成 |
-| 未签名 `.dbxp` + Release | 已完成（`v0.2.3`，`windows-x64`） |
+| 四平台构建与测试 | 已完成（CI：windows-x64 / linux-x64 / darwin-x64 / darwin-arm64 全绿） |
+| 未签名 `.dbxp` + Release | 已完成（`v0.2.4`，四个平台） |
 | 向 `dbx-store` 提 PR | **待办** |
 | 维护者签名合并 | 等待审核 |
 
-> 只发布了一个平台。官方允许按平台提交单个 target；若以后验证了
-> Linux/macOS 的 sidecar，可在 `targets` 里追加对应条目后重新提交新版本。
+> `v0.2.3` 只有 `windows-x64` 一个产物，已被 `v0.2.4` 取代；提交商店请用
+> `v0.2.4`，四个 target 一次提交完。

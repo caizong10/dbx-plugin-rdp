@@ -109,7 +109,7 @@ cd backend && cargo test --release   # Rust 25 项
 - 推 tag：额外把所有目标的 `.dbxp` 附加到该 tag 的 GitHub Release。
 
 ```bash
-git tag v0.2.3 && git push origin v0.2.3
+git tag v0.2.4 && git push origin v0.2.4
 ```
 
 ## Windows + GNU 工具链
