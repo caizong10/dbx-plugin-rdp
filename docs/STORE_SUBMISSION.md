@@ -77,26 +77,26 @@
     {
       "target": "windows-x64",
       "url": "https://github.com/caizong10/dbx-plugin-rdp/releases/download/v0.2.4/io.github.caizong10.rdp-0.2.4-windows-x64.dbxp",
-      "sha256": "SHA_WINDOWS_X64",
-      "size": 0
+      "sha256": "0c179c856faf76649e40eeae43e4b37ba6bae676c66f0a770a01b4e88a5c132e",
+      "size": 3236353
     },
     {
       "target": "linux-x64",
       "url": "https://github.com/caizong10/dbx-plugin-rdp/releases/download/v0.2.4/io.github.caizong10.rdp-0.2.4-linux-x64.dbxp",
-      "sha256": "SHA_LINUX_X64",
-      "size": 0
+      "sha256": "38d553de93f1aa2801080e6eab67ef08b7fb580fbc93b6f2703cd5e6e2768853",
+      "size": 3313333
     },
     {
       "target": "darwin-x64",
       "url": "https://github.com/caizong10/dbx-plugin-rdp/releases/download/v0.2.4/io.github.caizong10.rdp-0.2.4-darwin-x64.dbxp",
-      "sha256": "SHA_DARWIN_X64",
-      "size": 0
+      "sha256": "c5679e20181bb6dee8a0e378fe42067a8fa6fba1475e6d0d463a7ec40254baf2",
+      "size": 3189100
     },
     {
       "target": "darwin-arm64",
       "url": "https://github.com/caizong10/dbx-plugin-rdp/releases/download/v0.2.4/io.github.caizong10.rdp-0.2.4-darwin-arm64.dbxp",
-      "sha256": "SHA_DARWIN_ARM64",
-      "size": 0
+      "sha256": "0580e280a56d6be6afdc0fe1e9442178a0a6526f842f25793d07b3117851ae95",
+      "size": 2971405
     }
   ]
 }
