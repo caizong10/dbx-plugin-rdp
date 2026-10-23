@@ -53,7 +53,7 @@ lock file"；而日常 `cargo build` / `dbx-plugin dev` 又会把它抹掉。所
 |---|---|---|
 | `windows-x64` | windows-latest | |
 | `linux-x64` | ubuntu-latest | 剪贴板走 X11（`x11rb`）；Wayland 下依赖 XWayland |
-| `darwin-x64` | macos-13 | Intel |
+| `darwin-x64` | macos-15-intel | Intel |
 | `darwin-arm64` | macos-14 | Apple Silicon |
 
 四个目标都在 CI 里跑完整测试与打包（见下）。
@@ -100,7 +100,7 @@ cd backend && cargo test --release   # Rust 25 项
 ## 发布
 
 [`.github/workflows/plugin-release.yml`](../.github/workflows/plugin-release.yml)
-在 `windows-latest` / `ubuntu-latest` / `macos-13` / `macos-14` 四个运行器上
+在 `windows-latest` / `ubuntu-latest` / `macos-15-intel` / `macos-14` 四个运行器上
 并行跑：类型检查 → 前后端测试 → 构建 UI 与 sidecar → `dbx-plugin package`
 生成**未签名候选包**。
 
