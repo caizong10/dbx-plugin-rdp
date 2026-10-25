@@ -53,6 +53,10 @@ jobs:
           node-version: "22"
           cache: npm
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Install dependencies
@@ -134,15 +138,7 @@ jobs:
           TARGET: ${{ matrix.target }}
 
       - name: Verify sidecar identity
-        shell: bash
-        run: |
-          node -e '
-            const { spawnSync } = require("node:child_process");
-            const exe = `bin/${process.env.TARGET}/dbx-plugin-dbx-plugin-rdp${process.platform === "win32" ? ".exe" : ""}`;
-            const result = spawnSync(process.execPath, ["scripts/smoke-sidecar.mjs", exe], { stdio: "inherit" });
-            if (result.error) throw result.error;
-            process.exit(result.status ?? 1);
-          '
+        run: python scripts/smoke-package.py ${{ matrix.target }}
         env:
           TARGET: ${{ matrix.target }}
 

@@ -641,9 +641,10 @@ mod tests {
     #[test]
     fn descriptors_expand_nested_directories() {
         let dir = temp_dir("nested");
-        std::fs::create_dir_all(dir.join("root\\sub\\inner")).unwrap();
-        std::fs::write(dir.join("root\\sub\\inner\\a.txt"), b"a").unwrap();
-        std::fs::write(dir.join("root\\top.txt"), b"t").unwrap();
+        let nested = dir.join("root").join("sub").join("inner");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("a.txt"), b"a").unwrap();
+        std::fs::write(dir.join("root").join("top.txt"), b"t").unwrap();
         let files = clip_files::build_descriptors(&[dir.join("root")]).unwrap();
         assert_eq!(files.len(), 2);
         // Windows Explorer semantics: copying `root` yields root\top.txt and
@@ -661,7 +662,7 @@ mod tests {
         let dir = temp_dir("multi");
         std::fs::write(dir.join("a.txt"), b"a").unwrap();
         std::fs::create_dir_all(dir.join("b")).unwrap();
-        std::fs::write(dir.join("b\\c.txt"), b"c").unwrap();
+        std::fs::write(dir.join("b").join("c.txt"), b"c").unwrap();
         let files = clip_files::build_descriptors(&[dir.join("a.txt"), dir.join("b")]).unwrap();
         let names: Vec<(String, Option<String>)> = files
             .iter()
