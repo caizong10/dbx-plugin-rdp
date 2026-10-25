@@ -18,6 +18,7 @@ on:
     # verified instead of only at release time.
     branches:
       - main
+      - file-clipboard
     tags:
       - "v*"
   workflow_dispatch:
@@ -128,6 +129,19 @@ jobs:
             if (size < 1_000_000) {
               throw new Error(`package is ${size} bytes; the native sidecar is probably missing`);
             }
+          '
+        env:
+          TARGET: ${{ matrix.target }}
+
+      - name: Verify sidecar identity
+        shell: bash
+        run: |
+          node -e '
+            const { spawnSync } = require("node:child_process");
+            const exe = `bin/${process.env.TARGET}/dbx-plugin-dbx-plugin-rdp${process.platform === "win32" ? ".exe" : ""}`;
+            const result = spawnSync(process.execPath, ["scripts/smoke-sidecar.mjs", exe], { stdio: "inherit" });
+            if (result.error) throw result.error;
+            process.exit(result.status ?? 1);
           '
         env:
           TARGET: ${{ matrix.target }}

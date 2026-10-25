@@ -143,3 +143,30 @@ body {
   resize: none;
   overflow: hidden;
 }
+
+/* File-transfer status toast, bottom-left mirror of the reconnect bar. */
+.clip-toast {
+  position: absolute;
+  left: 50%;
+  top: 14px;
+  transform: translateX(-50%);
+  padding: 8px 14px;
+  border-radius: 10px;
+  font-size: 12px;
+  background: color-mix(in srgb, var(--color-popover, #18181b) 92%, transparent);
+  color: var(--color-popover-foreground, #fafafa);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.25);
+  pointer-events: none;
+  max-width: 80%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* "Pull remote files" button, pinned top-right of the canvas. */
+.pull-btn {
+  position: absolute;
+  top: 14px;
+  right: 16px;
+  z-index: 5;
+}

@@ -11,6 +11,7 @@ import {
   applySizePacket,
   keyPacket,
   mousePacket,
+  pullFilesPacket,
   unicodePacket,
   wheelPacket,
 } from "./protocol";
@@ -22,6 +23,8 @@ const canvasWrap = document.querySelector<HTMLElement>(".canvas-wrap")!;
 const canvas = document.querySelector<HTMLCanvasElement>("#screen")!;
 const overlay = document.querySelector<HTMLDivElement>("#overlay")!;
 const reconnectBar = document.querySelector<HTMLDivElement>("#reconnect")!;
+const clipToast = document.querySelector<HTMLDivElement>("#clip-toast")!;
+const pullFilesBtn = document.querySelector<HTMLButtonElement>("#pull-files")!;
 const retryBtn = document.querySelector<HTMLButtonElement>("#retry")!;
 const resSelect = document.querySelector<HTMLSelectElement>("#resolution")!;
 const resLabel = document.querySelector<HTMLSpanElement>("#res-label")!;
@@ -54,6 +57,9 @@ const COPY: Record<"en" | "zh", Record<string, string>> = {
     frames: "Receiving screen…",
     noSession: "This workbench has no connection. Open it from a connection.",
     connectFailed: "Connection failed",
+    clipStart: "Receiving {files} file(s){size}…",
+    clipDone: "{files} file(s) ready — paste anywhere",
+    clipFail: "File transfer failed: {reason}",
   },
   zh: {
     eyebrow: "DBX RDP 工作台",
@@ -68,6 +74,9 @@ const COPY: Record<"en" | "zh", Record<string, string>> = {
     frames: "正在接收画面…",
     noSession: "此工作台没有连接，请从连接项打开。",
     connectFailed: "连接失败",
+    clipStart: "正在接收 {files} 个文件{size}…",
+    clipDone: "{files} 个文件已就绪，可任意粘贴",
+    clipFail: "文件传输失败：{reason}",
   },
 };
 
@@ -222,6 +231,13 @@ function send(data: Uint8Array): void {
     console.warn("sendBinary failed", error);
   }
 }
+
+// Manual "pull remote files": re-arms the sidecar's deferred offer and
+// restarts its background pull — the folder-copy escape hatch.
+pullFilesBtn.addEventListener("click", () => {
+  showClipboardToast(lang() === "zh" ? "正在重新拉取远端剪贴板…" : "Re-pulling remote clipboard…");
+  send(pullFilesPacket(connectionId));
+});
 
 // ~60Hz cap with trailing-edge flush: the newest position always reaches the
 // server even when events arrive faster than the cap.
@@ -412,6 +428,19 @@ imeInput.addEventListener("input", (event) => {
 
 // ---------------------------------------------------------------- status
 
+// Clipboard transfer toast: shows while a remote file list downloads, then
+// fades. Reuses the reconnect-bar styling vocabulary.
+let clipToastTimer: number | undefined;
+function showClipboardToast(message: string): void {
+  clipToast.textContent = message;
+  clipToast.hidden = false;
+  if (clipToastTimer !== undefined) window.clearTimeout(clipToastTimer);
+  clipToastTimer = window.setTimeout(() => {
+    clipToast.hidden = true;
+    clipToastTimer = undefined;
+  }, 4000);
+}
+
 function setStatus(state: string, message?: string): void {
   const showReconnect = state === "reconnecting" || state === "retry-failed" || state === "connection-lost";
   reconnectBar.hidden = !showReconnect;
@@ -520,17 +549,39 @@ async function boot(): Promise<void> {
     }
   });
   const offEvent = bridge.onEvent(({ method, params }) => {
-    if (method !== "rdp/status" && method !== "rdp/desktop") return;
+    if (method !== "rdp/status" && method !== "rdp/desktop" && method !== "rdp/clipboard") return;
     const detail = (params ?? {}) as {
       connectionId?: string;
       state?: string;
       width?: number;
       height?: number;
       detail?: { attempt?: number; message?: string };
+      direction?: string;
     };
     if (detail.connectionId && detail.connectionId !== connectionId) return;
     if (method === "rdp/status" && detail.state) {
       setStatus(detail.state, detail.detail?.message);
+    }
+    if (method === "rdp/clipboard") {
+      const payload = (params ?? {}) as {
+        state?: string;
+        direction?: string;
+        detail?: { files?: number; bytes?: number; reason?: string };
+      };
+      const d = payload.detail ?? {};
+      const mb = d.bytes ? ` (${(d.bytes / 1048576).toFixed(1)} MB)` : "";
+      if (payload.state === "started") {
+        showClipboardToast(t("clipStart", { files: d.files ?? 0, size: mb.trim() }));
+        // A remote copy landed: surface the manual pull button so a folder
+        // whose server render was late can be fetched with one click.
+        pullFilesBtn.hidden = false;
+      } else if (payload.state === "finished") {
+        showClipboardToast(t("clipDone", { files: d.files ?? 0 }));
+        pullFilesBtn.hidden = true;
+      } else if (payload.state === "failed") {
+        showClipboardToast(t("clipFail", { reason: d.reason ?? "" }));
+        pullFilesBtn.hidden = false;
+      }
     }
   });
 

@@ -1,6 +1,6 @@
 [package]
 name = "dbx-plugin-dbx-plugin-rdp"
-version = "0.2.4"
+version = "0.2.7"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -37,6 +37,30 @@ x509-cert = "0.2"
 sha2 = "0.10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CF_HDROP file-list clipboard access on Windows (arboard does not expose
+# files) plus the WM_CLIPBOARDUPDATE monitor for event-driven change
+# detection (mstsc-style; replaces the timed poll). Already in the tree via
+# arboard's own Windows dependency, so this adds no new downloads.
+# Non-Windows builds do not pull it in.
+[target.'cfg(windows)'.dependencies]
+clipboard-win = { version = "5.4", features = ["monitor"] }
+windows-core = "0.62.2"
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage", "Win32_System_Ole",
+    "Win32_System_Memory", "Win32_System_DataExchange", "Win32_UI_Shell",
+] }
+# Raw Win32 for the deferred-rendering clipboard owner window (mstsc-style
+# delayed rendering). Already in the tree; multiple crates depend on it.
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_DataExchange",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 # Keep plugin binaries close to the host app's size.
 # panic stays "unwind" so the sidecar protocol can report panics as errors.
