@@ -58,6 +58,8 @@ lock file"；而日常 `cargo build` / `dbx-plugin dev` 又会把它抹掉。所
 
 四个目标都在 CI 里跑完整测试与打包（见下）。
 
+文件/文件夹剪贴板仅在 Windows 启用；Linux/macOS 不编译 OLE 提供者，只保留双向文本剪贴板。
+
 ## 在本地 DBX 里试用
 
 1. 打开 **DBX → 插件中心**。
@@ -94,7 +96,7 @@ npx @dbx-app/plugin-cli dev --path . --port 5190
 
 ```bash
 npm test                      # 前端 32 项
-cd backend && cargo test --release   # Rust 25 项
+cd backend && cargo test --release   # 包含平台策略与文件剪贴板回归，数量依平台而异
 ```
 
 ## 发布
@@ -109,7 +111,7 @@ cd backend && cargo test --release   # Rust 25 项
 - 推 tag：额外把所有目标的 `.dbxp` 附加到该 tag 的 GitHub Release。
 
 ```bash
-git tag v0.2.4 && git push origin v0.2.4
+git tag v0.2.7 && git push origin v0.2.7
 ```
 
 ## Windows + GNU 工具链

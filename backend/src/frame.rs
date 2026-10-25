@@ -143,6 +143,10 @@ pub enum InputKind {
     Unicode { flags: u16, code: u16 },
     /// User clicked Apply in the workbench: reconnect at this desktop size.
     ApplySize { width: u16, height: u16 },
+    /// User clicked the workbench's "pull remote files" button: re-run the
+    /// deferred-offer arm + background pull so a folder copy whose server
+    /// render arrived late can be fetched with one explicit click.
+    PullFiles,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,6 +256,7 @@ pub fn parse_input(data: &[u8]) -> Result<InputMessage, String> {
             width: read_u16(0)?,
             height: read_u16(2)?,
         },
+        6 => InputKind::PullFiles,
         other => return Err(format!("unknown input kind {other}")),
     };
     Ok(InputMessage { connection_id, event })

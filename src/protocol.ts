@@ -121,6 +121,15 @@ export function applySizePacket(connectionId: string, width: number, height: num
   return new Uint8Array(body);
 }
 
+/// kind 6: the user pressed the workbench's "pull remote files" button —
+/// the sidecar re-arms the deferred offer and restarts the background pull.
+export function pullFilesPacket(connectionId: string): Uint8Array {
+  const body: number[] = [];
+  pushId(body, connectionId);
+  body.push(6);
+  return new Uint8Array(body);
+}
+
 export interface BinaryEnvelope {
   channel: string;
   data: Uint8Array;

@@ -3,7 +3,7 @@
   "manifest_version": 1,
   "id": "io.github.caizong10.rdp",
   "name": "RDP Remote Desktop",
-  "version": "0.2.4",
+  "version": "0.2.7",
   "publisher": "caizong10",
   "description": "RDP remote desktop connections inside DBX, powered by a Rust (IronRDP) sidecar.",
   "icon": "assets/plugin.svg",

@@ -63,6 +63,10 @@ struct SessionParams {
     /// Format id the server advertises for Unicode text (0 = not seen yet).
     /// Long-format-name servers register CF_UNICODETEXT under a dynamic id.
     remote_text_format: Arc<AtomicU32>,
+    /// Format id the server advertises for the file list (0 = not seen yet).
+    remote_file_format: Arc<AtomicU32>,
+    /// Consecutive FAIL count for the current file-list paste.
+    file_retry_attempt: Arc<AtomicU32>,
 }
 
 type UpgradedFramed = ironrdp_blocking::Framed<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>;
@@ -116,6 +120,8 @@ impl ConnectEngine for IronRdpEngine {
             resize_pending: AtomicU8::new(0),
             clip_tx,
             remote_text_format: Arc::new(AtomicU32::new(0)),
+            remote_file_format: Arc::new(AtomicU32::new(0)),
+            file_retry_attempt: Arc::new(AtomicU32::new(0)),
         });
 
         let emitter = emitter.cloned();
@@ -187,6 +193,12 @@ fn open_session(
         crate::clipboard::TextClipboard::new(
             params.clip_tx.clone(),
             Arc::clone(&params.remote_text_format),
+            // Share ONE atomic with the session loop: the backend stores the
+            // chosen file format id on remote copy, and the deferred render
+            // path reads it for initiate_paste. Two separate atomics left
+            // the session side forever 0, pasting the wrong format id.
+            Arc::clone(&params.remote_file_format),
+            Arc::clone(&params.file_retry_attempt),
         ),
     )));
     let should_upgrade = connect_begin(&mut framed, &mut connector)
@@ -338,6 +350,13 @@ macro_rules! clip_op {
         match outcome {
             Some(Ok(messages)) => {
                 crate::diag::note(&format!("{}: processor ok", $label));
+                let messages: Vec<ironrdp_svc::SvcMessage> = messages.into();
+                for message in &messages {
+                    if let Ok(pdu) = message.encode_unframed_pdu() {
+                        crate::clip_dump::dump("TX-PDU", &pdu);
+                    }
+                }
+                let messages = ironrdp_svc::SvcProcessorMessages::<ironrdp_cliprdr::CliprdrClient>::new(messages);
                 match stage.process_svc_processor_messages(messages) {
                     Ok(frame) => {
                         crate::diag::note(&format!("{}: wrote {} byte(s) to channel", $label, frame.len()));
@@ -581,6 +600,11 @@ fn run_active_session(
         connection_result.desktop_size.width,
         connection_result.desktop_size.height,
     );
+    // CLIPRDR channel id (RX dump filter): resolved BEFORE the channel set
+    // is moved into the stage.
+    let cliprdr_channel_id = connection_result
+        .static_channels
+        .get_channel_id_by_type::<ironrdp_cliprdr::CliprdrClient>();
     let mut active_stage = ActiveStageBuilder {
         static_channels: connection_result.static_channels,
         user_channel_id: connection_result.user_channel_id,
@@ -604,8 +628,13 @@ fn run_active_session(
         framed,
         "cliprdr client init",
         |cliprdr: &mut ironrdp_cliprdr::CliprdrClient| cliprdr
-            .initiate_copy(&crate::clipboard::unicode_text_formats())
+            .initiate_copy(&crate::clipboard::supported_clipboard_formats())
     );
+    // The opening handshake above is done; file advertise/paste operations
+    // queued before this point must wait — see the clip_ready gate in the
+    // command pump (a copy detected between process start and channel Ready
+    // used to fail with "clipboard channel is not in Ready state").
+    let mut clip_ready = false;
 
     // Decouple frame delivery from this thread so a burst of graphics updates
     // (fast scrolling) can never block socket reads or input handling.
@@ -619,6 +648,60 @@ fn run_active_session(
     let mut last_clip_poll = Instant::now() - Duration::from_secs(1);
     let mut last_sent_text: Option<String> = None;
     let mut last_poll_error: Option<String> = None;
+
+    // ---- file clipboard state (Windows-native path; text path untouched) ----
+    // Outbound: files we advertised to the remote, keyed by list index.
+    let mut outbound = crate::clip_transfer::OutboundTable::new();
+    let mut stream_index = crate::clip_transfer::StreamIndexMap::new();
+    // What our last local CF_HDROP snapshot looked like (sorted joined
+    // paths), so the 300ms poll only advertises on a real change.
+    let mut last_local_files: Option<String> = None;
+    // Echo guard: the joined snapshot written by our own Publish event. When
+    // the poll reads it back, it must not re-advertise to the remote (the
+    // remote just pasted those files; echoing them re-enters its clipboard).
+    let mut suppress_publish_echo: Option<String> = None;
+    // Event-driven clipboard changes (Windows: WM_CLIPBOARDUPDATE watcher;
+    // other platforms: no events, the timed poll below keeps working).
+    let (clip_watch_tx, clip_watch_rx) = std::sync::mpsc::channel::<crate::clip_watch::ClipboardEvent>();
+    let _watcher = crate::clip_watch::spawn(clip_watch_tx);
+    // True once the watcher reported a failure: fall back to poll-only.
+    let mut watcher_failed = false;
+    // Clipboard access is paused until this instant after each publish
+    // (see the quiet-window comment at the poll site).
+    let mut publish_quiet_until: Option<Instant> = None;
+    // ---- deferred-offer plumbing ----
+    // Legacy render-pull channel: nothing sends on it anymore (the render
+    // never blocks); the drain below keeps any stray sender harmless.
+    let (_render_pull_tx, render_pull_rx) =
+        std::sync::mpsc::channel::<()>();
+    // True between arming the delayed offer and the background pull's
+    // publish; while set, a completed download replaces the delayed entry
+    // with the real HDROP (mark_background_published).
+    let mut awaiting_render = false;
+    // stream ids for downloads; odd numbers so they can never collide with
+    // anything the server picks (server-chosen ids are echoed verbatim).
+    let mut next_stream_id: u32 = 1;
+    let (file_events_tx, file_events_rx) = std::sync::mpsc::sync_channel::<crate::clip_transfer::TransferEvent>(32);
+    let (file_req_tx, file_req_rx) = std::sync::mpsc::sync_channel::<ironrdp_cliprdr::pdu::FileContentsRequest>(64);
+    let staging_dir = std::env::temp_dir().join(format!("dbx-rdp-clip-{}", params.connection_id));
+    let _ = std::fs::create_dir_all(&staging_dir);
+    let transfer = crate::clip_transfer::spawn_download_thread(
+        staging_dir,
+        file_events_tx,
+        file_req_tx,
+    );
+    let (virtual_reader, mut virtual_bridge) = crate::clip_transfer::VirtualTransferBridge::new(Duration::from_secs(30));
+    let mut virtual_generation = 0u64;
+    let mut fallback_descriptors = Vec::new();
+    let (virtual_failure_tx, virtual_failure_rx) = std::sync::mpsc::sync_channel::<u64>(1);
+    struct ClipboardSessionGuard;
+    impl Drop for ClipboardSessionGuard {
+        fn drop(&mut self) {
+            #[cfg(windows)]
+            crate::clip_owner::cancel_virtual(0);
+        }
+    }
+    let _clipboard_session = ClipboardSessionGuard;
 
     loop {
         if shutdown.try_recv().is_ok() {
@@ -645,6 +728,31 @@ fn run_active_session(
             }
             match &batch[index] {
                 SessionCommand::Input(kind) => {
+                    if let crate::frame::InputKind::PullFiles = kind {
+                        // Workbench "pull remote files" button: re-run the
+                        // deferred arm + background pull. A folder copy whose
+                        // server-side render arrived late becomes fetchable
+                        // with one explicit click instead of re-copying.
+                        crate::diag::note("workbench: pull-remote-files button");
+                        let _ = params.clip_tx.try_send(
+                            crate::clipboard::ClipCommand::OfferRemoteFiles,
+                        );
+                        // A fresh retry ladder: the previous one may have
+                        // exhausted itself while the server was still busy.
+                        params.file_retry_attempt.store(0, Ordering::Relaxed);
+                        let dynamic = params.remote_file_format.load(Ordering::Relaxed);
+                        let format = ironrdp_cliprdr::pdu::ClipboardFormatId::new(if dynamic == 0 {
+                            15
+                        } else {
+                            dynamic
+                        });
+                        clip_op!(
+                            &mut active_stage,
+                            framed,
+                            "cliprdr initiate_paste(pull button)",
+                            |cliprdr: &mut ironrdp_cliprdr::CliprdrClient| cliprdr.initiate_paste(format)
+                        );
+                    }
                     if let Some(events) = input_to_fastpath(kind) {
                         match active_stage.process_fastpath_input(&mut image, &events) {
                             Ok(outputs) => {
@@ -709,7 +817,37 @@ fn run_active_session(
         // Clipboard pump: commands queued by the CLIPRDR backend.
         while let Ok(command) = clip_rx.try_recv() {
             use crate::clipboard::ClipCommand;
+            // File/remote-paste traffic before the channel reached Ready
+            // would only error out ("not in Ready state"); drop it here and
+            // re-run the local clipboard once ClipboardReady arrives.
+            if !clip_ready {
+                match command {
+                    ClipCommand::AdvertiseText | ClipCommand::ClipboardReady => {}
+                    _ => continue,
+                }
+            }
             match command {
+                ClipCommand::ClipboardReady => {
+                    clip_ready = true;
+                    crate::diag::note("session loop: clipboard channel Ready; file ops unblocked");
+                    // Re-read the local clipboard now: files copied during
+                    // the handshake were skipped above.
+                    read_local_clipboard(
+                        &mut clipboard,
+                        &mut last_sent_text,
+                        &mut last_poll_error,
+                        &mut last_local_files,
+                        &mut suppress_publish_echo,
+                        &params.clip_tx,
+                        &mut active_stage,
+                        framed,
+                    );
+                }
+                ClipCommand::SendFormatListResponse => {
+                    // FormatListResponse is sent automatically by the crate when it
+                    // receives a FormatList from the server. No manual action needed.
+                    crate::diag::note("session loop: FormatListResponse (auto-handled by crate)");
+                }
                 ClipCommand::AdvertiseText => {
                     if let Some(text) = clipboard.as_mut().and_then(|c| c.get_text().ok()) {
                         if last_sent_text.as_deref() != Some(text.as_str()) {
@@ -721,7 +859,7 @@ fn run_active_session(
                         framed,
                         "cliprdr initiate_copy",
                         |cliprdr: &mut ironrdp_cliprdr::CliprdrClient| cliprdr
-                            .initiate_copy(&crate::clipboard::unicode_text_formats())
+                            .initiate_copy(&crate::clipboard::supported_clipboard_formats())
                     );
                 }
                 ClipCommand::SendText(format_id) => {
@@ -750,6 +888,74 @@ fn run_active_session(
                             .submit_format_data(ironrdp_core::IntoOwned::into_owned(response))
                     );
                 }
+                ClipCommand::LocalFilesSuperseded => {
+                    // Remote clipboard moved on: drop the dedupe key and the
+                    // outbound handles so a later re-copy re-advertises.
+                    last_local_files = None;
+                    outbound.replace(Vec::new());
+                    virtual_bridge.begin_generation(0, None);
+                    #[cfg(windows)]
+                    crate::clip_owner::cancel_virtual(virtual_generation);
+                }
+                ClipCommand::RefuseFormat(format_id) => {
+                    // A format we do not carry (e.g. FileNameW probed by
+                    // Explorer during a file paste): clean CB_RESPONSE_FAIL
+                    // so the remote skips it instead of stalling the paste.
+                    crate::diag::note(&format!("refusing format #{format_id}"));
+                    clip_op!(
+                        &mut active_stage,
+                        framed,
+                        "cliprdr submit_format_data(refuse)",
+                        |cliprdr: &mut ironrdp_cliprdr::CliprdrClient| cliprdr
+                            .submit_format_data(ironrdp_cliprdr::pdu::OwnedFormatDataResponse::new_error())
+                    );
+                }
+                ClipCommand::OfferRemoteFiles => {
+                    // Echo guard: right after a local paste rendered our
+                    // deferred data, the server announces the clipboard
+                    // change back at us (the paste itself changed the remote
+                    // session's clipboard). Re-arming would EmptyClipboard
+                    // and destroy the data the user just pasted with — the
+                    // observed "wrote 3 files, clipboard ends up empty".
+                    // Skip re-arm while our render output is live; the next
+                    // genuine remote copy clears it via a new offer.
+                    if crate::clip_owner::render_recent(3000) {
+                        crate::diag::note("session loop: skipping re-arm (echo after our own render)");
+                        continue;
+                    }
+                    // Delayed offer + background pull (zero-block render).
+                    // The delayed CF_HDROP keeps Paste enabled; the
+                    // background pull (retry ladder for wave-1 FAILs,
+                    // re-armed on the wave-2 announcement) stages the real
+                    // files and publishes the real HDROP the moment the
+                    // server cooperates. WM_RENDERFORMAT never blocks: it
+                    // serves the staged data or an empty drop instantly.
+                    crate::diag::note("session loop: arming deferred file offer");
+                    // Do not publish an empty CF_HDROP placeholder. Publish
+                    // metadata once it arrives; first paste then reads bytes.
+                    {
+                        virtual_bridge.begin_generation(0, None);
+                        #[cfg(windows)]
+                        crate::clip_owner::cancel_virtual(virtual_generation);
+                        awaiting_render = true;
+                        let dynamic = params.remote_file_format.load(Ordering::Relaxed);
+                        let format = ironrdp_cliprdr::pdu::ClipboardFormatId::new(if dynamic == 0 {
+                            15
+                        } else {
+                            dynamic
+                        });
+                        crate::diag::note(&format!(
+                            "background pull: initiate_paste on format #{}",
+                            dynamic
+                        ));
+                        clip_op!(
+                            &mut active_stage,
+                            framed,
+                            "cliprdr initiate_paste(background)",
+                            |cliprdr: &mut ironrdp_cliprdr::CliprdrClient| cliprdr.initiate_paste(format)
+                        );
+                    }
+                }
                 ClipCommand::FetchRemoteText => {
                     // Request the exact text format id the server advertised
                     // (dynamic under long format names); fall back to
@@ -766,6 +972,41 @@ fn run_active_session(
                         "cliprdr initiate_paste",
                         |cliprdr: &mut ironrdp_cliprdr::CliprdrClient| cliprdr.initiate_paste(format)
                     );
+                }
+                ClipCommand::RetryPaste { format_id, attempt } => {
+                    // Windows servers render file-list data lazily: the
+                    // first FormatDataRequest right after a copy frequently
+                    // comes back CB_RESPONSE_FAIL. Folder copies in
+                    // particular announce in two waves: the immediate
+                    // prelude (no FileGroupDescriptorW — every request
+                    // FAILs) and the full descriptor announcement tens of
+                    // seconds later, once the server-side Explorer finished
+                    // enumerating the directory. So: keep retrying through
+                    // the whole 30s render window rather than giving up
+                    // after a fixed count; the second wave makes it succeed
+                    // (verified live: folder pull succeeded 80s late).
+                    if attempt >= 30 {
+                        crate::diag::note(&format!(
+                            "file paste format #{format_id} failed after {attempt} attempts; giving up"
+                        ));
+                    } else {
+                        // 800ms growing to ~2s, capped; the loop exits early
+                        // the moment a wave-2 announcement succeeds.
+                        let delay = (800u64 + u64::from(attempt) * 50).min(2000);
+                        std::thread::sleep(Duration::from_millis(delay));
+                        crate::diag::note(&format!(
+                            "file paste format #{format_id} attempt {} -> retry",
+                            attempt + 1
+                        ));
+                        clip_op!(
+                            &mut active_stage,
+                            framed,
+                            "cliprdr initiate_paste(retry)",
+                            |cliprdr: &mut ironrdp_cliprdr::CliprdrClient| cliprdr.initiate_paste(
+                                ironrdp_cliprdr::pdu::ClipboardFormatId::new(format_id)
+                            )
+                        );
+                    }
                 }
                 ClipCommand::RemoteText(text) => {
                     if clipboard.is_none() {
@@ -786,53 +1027,312 @@ fn run_active_session(
                         None => crate::diag::note(&format!("remote text len={length} DROPPED: no arboard handle")),
                     }
                 }
+                ClipCommand::FetchRemoteFiles(format_id) => {
+                    // Ask the server for its FileGroupDescriptorW; the
+                    // response is intercepted by Cliprdr and lands in
+                    // on_remote_file_list -> RemoteFileList below.
+                    let format = ironrdp_cliprdr::pdu::ClipboardFormatId::new(format_id);
+                    clip_op!(
+                        &mut active_stage,
+                        framed,
+                        "cliprdr initiate_paste(files)",
+                        |cliprdr: &mut ironrdp_cliprdr::CliprdrClient| cliprdr.initiate_paste(format)
+                    );
+                }
+                ClipCommand::RemoteFileList { descriptors, data_id } => {
+                    virtual_generation = virtual_generation.saturating_add(1);
+                    let generation = virtual_generation;
+                    virtual_bridge.begin_generation(generation, data_id);
+                    fallback_descriptors = descriptors.clone();
+                    #[cfg(windows)]
+                    {
+                        let entries = descriptors.iter().map(|d| crate::clip_virtual::VirtualFileEntry {
+                            name: d.name.clone(), relative_path: d.relative_path.clone(), size: d.file_size.unwrap_or(0),
+                            is_directory: d.attributes.is_some_and(|a| a.contains(ironrdp_cliprdr::pdu::ClipboardFileAttributes::DIRECTORY)),
+                        }).collect();
+                        let reader = virtual_reader.clone();
+                        let failures = virtual_failure_tx.clone();
+                        // Unknown lengths use the compatible staging path;
+                        // never label an unknown file as a successful empty file.
+                        if descriptors.iter().all(|d| d.file_size.is_some() || d.attributes.is_some_and(|a| a.contains(ironrdp_cliprdr::pdu::ClipboardFileAttributes::DIRECTORY))) {
+                            if let Ok(source) = crate::clip_virtual::VirtualClipboard::new(entries, move |index, position, length| {
+                                let result = reader.read(generation, index, position, length);
+                                if result.is_err() { let _ = failures.try_send(generation); }
+                                result
+                            }) {
+                                if crate::clip_owner::offer_virtual(generation, source) {
+                                    awaiting_render = false;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    // Remote copied files: allocate (stream_id, lindex) pairs,
+                    // then hand the download thread everything it needs to
+                    // drive the chunk ladder.
+                    let mut entries = Vec::with_capacity(descriptors.len());
+                    for (i, descriptor) in descriptors.iter().enumerate() {
+                        let stream_id = next_stream_id;
+                        next_stream_id = next_stream_id.wrapping_add(2).max(1);
+                        let index = i32::try_from(i).unwrap_or(0);
+                        stream_index.assign(stream_id, index);
+                        entries.push((stream_id, index, descriptor.clone()));
+                    }
+                    let count = entries.len();
+                    let _ = transfer.send(crate::clip_transfer::TransferCommand::Download(entries));
+                    crate::diag::note(&format!("file download started: {count} file(s)"));
+                }
+                ClipCommand::AdvertiseLocalFiles(roots) => {
+                    // Snapshot arrived from the poll: dedupe, expand, announce.
+                    let joined = roots
+                        .iter()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if last_local_files.as_deref() == Some(joined.as_str()) {
+                        // Same file set already advertised; skip.
+                    } else {
+                        match crate::clip_files::build_descriptors(&roots) {
+                            Ok(files) if files.is_empty() => {}
+                            Ok(files) => {
+                                let count = files.len();
+                                let descriptors: Vec<ironrdp_cliprdr::pdu::FileDescriptor> =
+                                    files.iter().map(|f| f.descriptor.clone()).collect();
+                                outbound.replace(files);
+                                last_local_files = Some(joined);
+                                clip_op!(
+                                    &mut active_stage,
+                                    framed,
+                                    "cliprdr initiate_file_copy",
+                                    |cliprdr: &mut ironrdp_cliprdr::CliprdrClient| cliprdr
+                                        .initiate_file_copy(descriptors.clone())
+                                );
+                                crate::diag::note(&format!("advertised {count} local file(s) to remote"));
+                            }
+                            Err(error) => {
+                                crate::diag::note(&format!("build_descriptors failed: {error}"));
+                            }
+                        }
+                    }
+                }
+                ClipCommand::ServeFileChunk(request) => {
+                    // Remote paste is pulling bytes of our advertised files.
+                    // The Cliprdr processor validated the index against the
+                    // advertised list already; serve from disk and submit.
+                    let result = outbound.serve(&request);
+                    match result {
+                        Ok(Some(response)) => {
+                            clip_op!(
+                                &mut active_stage,
+                                framed,
+                                "cliprdr submit_file_contents",
+                                |cliprdr: &mut ironrdp_cliprdr::CliprdrClient| cliprdr
+                                    .submit_file_contents(ironrdp_core::IntoOwned::into_owned(response))
+                            );
+                        }
+                        Ok(None) => {}
+                        Err(reason) => {
+                            crate::diag::note(&format!("serve file chunk failed: {reason}"));
+                            let error = ironrdp_cliprdr::pdu::FileContentsResponse::new_error(request.stream_id);
+                            clip_op!(
+                                &mut active_stage,
+                                framed,
+                                "cliprdr submit_file_contents(error)",
+                                |cliprdr: &mut ironrdp_cliprdr::CliprdrClient| cliprdr
+                                    .submit_file_contents(error)
+                            );
+                        }
+                    }
+                }
+                ClipCommand::DownloadChunk(response) => {
+                    // A chunk of an in-flight download arrived; forward to the
+                    // download thread, which owns the staging state.
+                    let stream_id = response.stream_id();
+                    if virtual_bridge.respond(response.clone()) { continue; }
+                    // Virtual IDs occupy the upper half; late responses must
+                    // not leak into the fallback download state machine.
+                    if stream_id >= 0x80000000 { continue; }
+                    let _ = transfer.send(crate::clip_transfer::TransferCommand::Chunk {
+                        stream_id,
+                        response,
+                    });
+                }
             }
         }
 
-        // Poll the local clipboard; when it changed, advertise to the server.
-        if last_clip_poll.elapsed() >= Duration::from_millis(300) {
+        while let Ok(failed_generation) = virtual_failure_rx.try_recv() {
+            if failed_generation != virtual_generation { continue; }
+            crate::diag::note(&format!("virtual read failed generation={failed_generation}; staging fallback"));
+            virtual_bridge.begin_generation(0, None);
+            #[cfg(windows)]
+            crate::clip_owner::cancel_virtual(failed_generation);
+            let mut entries = Vec::new();
+            for (index, descriptor) in fallback_descriptors.iter().enumerate() {
+                let id = next_stream_id;
+                next_stream_id = next_stream_id.wrapping_add(2).max(1);
+                entries.push((id, index as i32, descriptor.clone()));
+            }
+            let _ = transfer.send(crate::clip_transfer::TransferCommand::Download(entries));
+        }
+        while let Some(request) = virtual_bridge.next_request() {
+            crate::diag::note(&format!("virtual read generation={} stream={} index={} offset={} length={}", virtual_generation, request.stream_id, request.index, request.position, request.requested_size));
+            clip_op!(&mut active_stage, framed, "cliprdr virtual file read", |cliprdr: &mut ironrdp_cliprdr::CliprdrClient| cliprdr.request_file_contents(request.clone()));
+        }
+
+        // Download-thread -> server pump: FileContentsRequests the thread
+        // generated (chunk ladder), sent through the Cliprdr processor so
+        // stream ids are tracked and capabilities re-checked.
+        while let Ok(request) = file_req_rx.try_recv() {
+            clip_op!(
+                &mut active_stage,
+                framed,
+                "cliprdr request_file_contents",
+                |cliprdr: &mut ironrdp_cliprdr::CliprdrClient| cliprdr
+                    .request_file_contents(request.clone())
+            );
+        }
+
+        // Deferred-render pull pump: the owner-thread callback (inside
+        // WM_RENDERFORMAT, i.e. the user just pasted) asks for the server
+        // pull here. We issue the paste request now; the resulting download
+        // routes its paths back through render_done when it completes.
+        while render_pull_rx.try_recv().is_ok() {
+            crate::diag::note("session loop: render pull requested -> initiate_paste");
+            awaiting_render = true;
+            let dynamic = params.remote_file_format.load(Ordering::Relaxed);
+            let format = ironrdp_cliprdr::pdu::ClipboardFormatId::new(if dynamic == 0 {
+                15
+            } else {
+                dynamic
+            });
+            clip_op!(
+                &mut active_stage,
+                framed,
+                "cliprdr initiate_paste(deferred)",
+                |cliprdr: &mut ironrdp_cliprdr::CliprdrClient| cliprdr.initiate_paste(format)
+            );
+        }
+
+        // Transfer-thread events -> UI status pump (rdp/clipboard), plus the
+        // clipboard publish, which runs HERE so every OS clipboard access
+        // stays on the session thread (the old cross-thread write raced the
+        // 300ms poll for the global clipboard lock and surfaced as
+        // "permission denied" on Windows).
+        while let Ok(event) = file_events_rx.try_recv() {
+            use crate::clip_transfer::TransferEvent;
+            if let TransferEvent::Publish { paths } = &event {
+                // The background pull completed: replace the delayed entry
+                // with the REAL HDROP. The render cache is primed
+                // (mark_background_published) so any later WM_RENDERFORMAT
+                // serves these files instead of an empty drop.
+                if awaiting_render {
+                    awaiting_render = false;
+                }
+                let joined = paths
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                match crate::clip_files::set_local_file_list(paths) {
+                    Ok(()) => {
+                        suppress_publish_echo = Some(joined);
+                        publish_quiet_until = Some(Instant::now() + Duration::from_millis(1000));
+                        crate::clip_owner::mark_background_published(paths);
+                        crate::diag::note(&format!(
+                            "published {} staged file(s) to local clipboard",
+                            paths.len()
+                        ));
+                    }
+                    Err(error) => {
+                        crate::diag::note(&format!("publish CF_HDROP failed: {error}"));
+                    }
+                }
+            }
+            if let Some(emitter) = emitter {
+                let (state, detail) = match &event {
+                    TransferEvent::Started { files, bytes } => {
+                        ("started", serde_json::json!({ "files": files, "bytes": bytes }))
+                    }
+                    TransferEvent::Progress { bytes } => {
+                        ("progress", serde_json::json!({ "bytes": bytes }))
+                    }
+                    TransferEvent::Finished { files, bytes } => {
+                        ("finished", serde_json::json!({ "files": files, "bytes": bytes }))
+                    }
+                    TransferEvent::Failed { reason } => {
+                        ("failed", serde_json::json!({ "reason": reason }))
+                    }
+                    TransferEvent::Publish { paths } => {
+                        ("finished", serde_json::json!({ "files": paths.len(), "bytes": 0 }))
+                    }
+                };
+                let _ = emitter.event(
+                    "rdp/clipboard",
+                    serde_json::json!({
+                        "connectionId": params.connection_id,
+                        "direction": "download",
+                        "state": state,
+                        "detail": detail,
+                    }),
+                );
+            }
+        }
+
+        // Local clipboard: event-driven on Windows (WM_CLIPBOARDUPDATE, the
+        // same mechanism mstsc uses), timed poll elsewhere. Either way the
+        // clipboard is read exactly once per change, files first.
+        let clipboard_tick = clip_watch_rx
+            .try_recv()
+            .map(|event| match event {
+                crate::clip_watch::ClipboardEvent::Changed => true,
+                crate::clip_watch::ClipboardEvent::Failed(reason) => {
+                    crate::diag::note(&format!("clipboard watcher: {reason}; falling back to poll"));
+                    watcher_failed = true;
+                    true
+                }
+            })
+            .unwrap_or(false);
+        // Post-publish quiet window: right after we write CF_HDROP, hold off
+        // every clipboard access (watcher event or poll) for a moment.
+        // Explorer builds its right-click Paste menu by synchronously
+        // querying the clipboard owner; our watcher's OpenClipboard in that
+        // window made the menu item read as unavailable — Ctrl+V worked but
+        // right-click Paste did not. Yield the clipboard for ~1s after each
+        // publish so the user's paste gesture lands on a free clipboard.
+        let in_quiet_window = publish_quiet_until.map(|t| Instant::now() < t).unwrap_or(false);
+        if in_quiet_window {
+            // Drain watcher events without touching the clipboard so they
+            // do not pile up behind the window.
+            while clip_watch_rx.try_recv().is_ok() {}
+        }
+        if (clipboard_tick || watcher_failed || last_clip_poll.elapsed() >= Duration::from_millis(300))
+            && !in_quiet_window
+        {
+            read_local_clipboard(
+                &mut clipboard,
+                &mut last_sent_text,
+                &mut last_poll_error,
+                &mut last_local_files,
+                &mut suppress_publish_echo,
+                &params.clip_tx,
+                &mut active_stage,
+                framed,
+            );
             last_clip_poll = Instant::now();
-            if clipboard.is_none() {
-                clipboard = arboard::Clipboard::new().ok();
-                if clipboard.is_none() {
-                    crate::diag::note("local poll: arboard handle unavailable");
-                }
-            }
-            // get_text errors are expected while the clipboard holds only
-            // files/bitmap (no CF_UNICODETEXT): log the exact failure so a
-            // real text-copy test can be told apart from a file selection.
-            match clipboard.as_mut().map(|handle| handle.get_text()) {
-                Some(Ok(text)) => {
-                    last_poll_error = None;
-                    if last_sent_text.as_deref() != Some(text.as_str()) {
-                        crate::diag::note(&format!("local poll: text changed len={} -> advertise", text.len()));
-                        last_sent_text = Some(text);
-                        clip_op!(
-                            &mut active_stage,
-                            framed,
-                            "cliprdr advertise",
-                            |cliprdr: &mut ironrdp_cliprdr::CliprdrClient| cliprdr
-                                .initiate_copy(&crate::clipboard::unicode_text_formats())
-                        );
-                    }
-                }
-                Some(Err(error)) => {
-                    // Clipboard holds non-text (files/bitmap): forget what we
-                    // advertised so re-copying the SAME text afterwards still
-                    // re-advertises.
-                    last_sent_text = None;
-                    let message = error.to_string();
-                    if last_poll_error.as_deref() != Some(message.as_str()) {
-                        last_poll_error = Some(message.clone());
-                        crate::diag::note(&format!("local poll: get_text error: {message}"));
-                    }
-                }
-                None => {}
-            }
         }
 
         match framed.read_pdu() {
             Ok((action, payload)) => {
+                // RX PDU dump: on slow-path frames, peek the MCS channel id;
+                // when it is the CLIPRDR channel, dump the raw user_data
+                // (post-MCS, pre-PDU-decode) for byte-level diffing.
+                if let (Some(want), ironrdp_pdu::Action::X224) = (cliprdr_channel_id, action) {
+                    if let Ok(ctx) = ironrdp_pdu::mcs::decode_send_data_indication(&payload) {
+                        if ctx.channel_id == want {
+                            crate::clip_dump::dump_svc_chunk(ctx.user_data);
+                        }
+                    }
+                }
                 match active_stage.process(&mut image, action, &payload) {
                     Ok(outputs) => {
                         for output in outputs {
@@ -898,6 +1398,90 @@ fn run_active_session(
                 return SessionEnd::Lost(format!("read failed: {e}"));
             }
         }
+    }
+}
+
+/// Read the local clipboard once and advertise what we find: files first
+/// (a CF_HDROP clipboard also exposes a text projection that must never be
+/// advertised — it would overwrite the file announcement), then text.
+/// Called on every clipboard-change event, with the timed poll as fallback.
+#[allow(clippy::too_many_arguments)]
+fn read_local_clipboard(
+    clipboard: &mut Option<arboard::Clipboard>,
+    last_sent_text: &mut Option<String>,
+    last_poll_error: &mut Option<String>,
+    last_local_files: &mut Option<String>,
+    suppress_publish_echo: &mut Option<String>,
+    clip_tx: &std::sync::mpsc::SyncSender<crate::clipboard::ClipCommand>,
+    active_stage: &mut ironrdp_session::ActiveStage,
+    framed: &mut UpgradedFramed,
+) {
+    #[cfg(windows)]
+    if crate::clip_owner::offer_active() { return; }
+    if clipboard.is_none() {
+        *clipboard = arboard::Clipboard::new().ok();
+        if clipboard.is_none() {
+            crate::diag::note("local poll: arboard handle unavailable");
+        }
+    }
+    // File side FIRST (see doc comment above).
+    let holds_files = match crate::clip_files::read_local_file_list() {
+        Ok(Some(list)) => {
+            let joined = list
+                .roots
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if suppress_publish_echo.as_deref() == Some(joined.as_str()) {
+                // Our own publish; treat as already advertised.
+                *last_local_files = Some(joined);
+            } else {
+                let _ = clip_tx.try_send(crate::clipboard::ClipCommand::AdvertiseLocalFiles(list.roots));
+            }
+            true
+        }
+        Ok(None) => {
+            // Clipboard moved on: the echo guard is now meaningless.
+            *suppress_publish_echo = None;
+            false
+        }
+        Err(_) => false,
+    };
+
+    if holds_files {
+        return; // never advertise the shell's text projection of file paths
+    }
+
+    // Text side: get_text errors are expected while the clipboard holds
+    // files/bitmap; log once per distinct error.
+    match clipboard.as_mut().map(|handle| handle.get_text()) {
+        Some(Ok(text)) => {
+            *last_poll_error = None;
+            if last_sent_text.as_deref() != Some(text.as_str()) {
+                crate::diag::note(&format!("local poll: text changed len={} -> advertise", text.len()));
+                *last_sent_text = Some(text);
+                clip_op!(
+                    active_stage,
+                    framed,
+                    "cliprdr advertise",
+                    |cliprdr: &mut ironrdp_cliprdr::CliprdrClient| cliprdr
+                        .initiate_copy(&crate::clipboard::supported_clipboard_formats())
+                );
+            }
+        }
+        Some(Err(error)) => {
+            // Clipboard holds non-text (files/bitmap): forget what we
+            // advertised so re-copying the SAME text afterwards still
+            // re-advertises.
+            *last_sent_text = None;
+            let message = error.to_string();
+            if last_poll_error.as_deref() != Some(message.as_str()) {
+                *last_poll_error = Some(message.clone());
+                crate::diag::note(&format!("local poll: get_text error: {message}"));
+            }
+        }
+        None => {}
     }
 }
 
@@ -1075,7 +1659,7 @@ fn input_to_fastpath(
             }
             Some(vec![FastPathInputEvent::UnicodeKeyboardEvent(kb, *code)])
         }
-        InputKind::Resize { .. } | InputKind::ApplySize { .. } => None,
+        InputKind::Resize { .. } | InputKind::ApplySize { .. } | InputKind::PullFiles => None,
     }
 }
 
