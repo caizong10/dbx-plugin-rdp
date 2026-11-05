@@ -1,6 +1,7 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use dbx_plugin_sdk::{
     host_client, PluginEmitter, PluginError, PluginHandler, RequestContext, UserInputOption,
@@ -41,12 +42,16 @@ pub fn ask_host_to_trust(host_display: String, fingerprint: String) -> Result<An
         return Err(HostError);
     }
     let prompt = UserInputPrompt::choice(
-        format!(
-            "Certificate SHA-256: {fingerprint}\nConnect to {host_display} anyway?"
-        ),
+        format!("Certificate SHA-256: {fingerprint}\nConnect to {host_display} anyway?"),
         vec![
-            UserInputOption { value: "approve".to_string(), label: "Trust and continue".to_string() },
-            UserInputOption { value: "deny".to_string(), label: "Cancel".to_string() },
+            UserInputOption {
+                value: "approve".to_string(),
+                label: "Trust and continue".to_string(),
+            },
+            UserInputOption {
+                value: "deny".to_string(),
+                label: "Cancel".to_string(),
+            },
         ],
     )
     .with_title("Untrusted RDP server certificate")
@@ -119,7 +124,7 @@ pub struct ConnectFailure(pub String);
 /// Outcome the connect RPC reports back to the host.
 enum Handshake {
     /// Session established within the synchronous window.
-    Ready(RdpSession),
+    Ready(RdpSession, Arc<AtomicBool>),
     /// Handshake failed (message never contains credentials).
     Failed(String),
     /// Handshake still running; a publisher thread registers the session and
@@ -135,7 +140,27 @@ const SYNC_HANDSHAKE_WINDOW: std::time::Duration = std::time::Duration::from_mil
 
 /// Shared registry so background handshake threads can publish sessions the
 /// same way the synchronous path used to.
-type Sessions = Arc<std::sync::Mutex<HashMap<String, RdpSession>>>;
+struct RegisteredSession {
+    session: RdpSession,
+    id: String,
+    dynamic: bool,
+    initial_resize_used: bool,
+}
+
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(0);
+
+fn register_session(session: RdpSession, dynamic: bool) -> RegisteredSession {
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+    let serial = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+    RegisteredSession { session, id: format!("{stamp:016x}{serial:016x}"), dynamic, initial_resize_used: false }
+}
+
+fn dynamic_mode(params: &Value) -> bool {
+    params.get("connection").and_then(|c| c.get("external_config")).and_then(|c| c.get("resize_mode"))
+        .and_then(Value::as_str) != Some("fixed")
+}
+
+type Sessions = Arc<std::sync::Mutex<HashMap<String, RegisteredSession>>>;
 
 pub struct RdpPlugin {
     sessions: Sessions,
@@ -166,12 +191,20 @@ impl RdpPlugin {
 
     /// Snapshot of an active session for UI state.
     pub fn session_info(&self, connection_id: &str) -> Option<SessionInfo> {
-        self.sessions.lock().ok().and_then(|map| map.get(connection_id).map(|s| s.info.clone()))
+        self.sessions
+            .lock()
+            .ok()
+            .and_then(|map| map.get(connection_id).map(|s| s.session.info.clone()))
     }
 
-    fn cleanup_handshake(&self, connection_id: &str) {
+    fn cleanup_handshake(&self, connection_id: &str, token: &Arc<AtomicBool>) {
         if let Ok(mut map) = self.handshakes.lock() {
-            map.remove(connection_id);
+            if map
+                .get(connection_id)
+                .is_some_and(|current| Arc::ptr_eq(current, token))
+            {
+                map.remove(connection_id);
+            }
         }
     }
 
@@ -222,28 +255,25 @@ impl RdpPlugin {
                 let _ = result_tx.send(outcome);
             });
         if spawn.is_err() {
-            self.cleanup_handshake(connection_id);
+            self.cleanup_handshake(connection_id, &cancel);
             return Handshake::Failed("Failed to start handshake thread".to_string());
         }
 
         match result_rx.recv_timeout(SYNC_HANDSHAKE_WINDOW) {
-            Ok(Ok(session)) => {
-                self.cleanup_handshake(connection_id);
-                Handshake::Ready(session)
-            }
+            Ok(Ok(session)) => Handshake::Ready(session, Arc::clone(&cancel)),
             Ok(Err(message)) => {
-                self.cleanup_handshake(connection_id);
+                self.cleanup_handshake(connection_id, &cancel);
                 Handshake::Failed(message)
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                self.cleanup_handshake(connection_id);
+                self.cleanup_handshake(connection_id, &cancel);
                 Handshake::Failed("RDP handshake thread ended without a result".to_string())
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 // Still dialing. Tell the workbench we are connecting, then
                 // publish the session (or the failure) when the thread ends.
                 let Some(emitter) = emitter.cloned() else {
-                    self.cleanup_handshake(connection_id);
+                    self.cleanup_handshake(connection_id, &cancel);
                     return Handshake::Failed(
                         "Handshake still running but no event channel is available.".to_string(),
                     );
@@ -257,50 +287,47 @@ impl RdpPlugin {
                     ),
                 );
                 let sessions = Arc::clone(&self.sessions);
+                let dynamic = dynamic_mode(params);
                 let handshakes = Arc::clone(&self.handshakes);
-                let cancel = Arc::clone(&cancel);
+                let cancel_for_publish = Arc::clone(&cancel);
                 let id_for_worker = connection_id.to_string();
                 let publish = std::thread::Builder::new()
                     .name(format!("dbx-rdp-publish-{id_for_worker}"))
                     .spawn(move || {
-                        let outcome = match result_rx.recv() {
-                            Ok(outcome) => outcome,
-                            Err(_) => {
-                                if let Ok(mut map) = handshakes.lock() {
-                                    map.remove(&id_for_worker);
-                                }
-                                return;
+                        let outcome = result_rx.recv();
+                        // Hold the handshake registry through publication. Disconnect
+                        // takes the same lock before the session lock, so a cancelled
+                        // or superseded generation cannot publish or remove a newer one.
+                        let Ok(mut registry) = handshakes.lock() else {
+                            if let Ok(Ok(session)) = outcome {
+                                let _ = session.shutdown.send(());
                             }
+                            return;
                         };
-                        match outcome {
-                            Ok(session) => {
-                                let info = session.info.clone();
-                                if cancel.load(Ordering::SeqCst) {
-                                    // User disconnected while we were dialing.
-                                    let _ = session.shutdown.send(());
-                                    if let Ok(mut map) = handshakes.lock() {
-                                        map.remove(&id_for_worker);
-                                    }
-                                    return;
-                                }
-                                if let Ok(mut map) = sessions.lock() {
-                                    map.insert(id_for_worker.clone(), session);
-                                }
-                                if let Ok(mut map) = handshakes.lock() {
-                                    map.remove(&id_for_worker);
-                                }
-                                tracing::info!(
-                                    peer = %info.dial_host,
-                                    port = info.dial_port,
-                                    "RDP background handshake succeeded"
-                                );
-                                // open_session already emitted connected and
-                                // the desktop event; nothing more to push.
+                        let current = registry
+                            .get(&id_for_worker)
+                            .is_some_and(|token| Arc::ptr_eq(token, &cancel_for_publish));
+                        if !current || cancel_for_publish.load(Ordering::SeqCst) {
+                            if let Ok(Ok(session)) = outcome {
+                                let _ = session.shutdown.send(());
                             }
-                            Err(message) => {
-                                if let Ok(mut map) = handshakes.lock() {
-                                    map.remove(&id_for_worker);
+                            return;
+                        }
+                        match outcome {
+                            Ok(Ok(session)) => {
+                                if let Ok(mut map) = sessions.lock() {
+                                    if let Some(old) = map.insert(id_for_worker.clone(), register_session(session, dynamic)) {
+                                        let _ = old.session.shutdown.send(());
+                                    }
+                                    if let Some(registered) = map.get(&id_for_worker) {
+                                        let ready = json!({"resizeMode": if registered.dynamic { "dynamic" } else { "fixed" }, "sessionId": registered.id});
+                                        let _ = emitter.event(frame::STATUS_EVENT, frame::status_payload(&id_for_worker, "session-ready", Some(ready)));
+                                    }
+                                } else {
+                                    let _ = session.shutdown.send(());
                                 }
+                            }
+                            Ok(Err(message)) => {
                                 tracing::warn!("RDP background handshake failed: {message}");
                                 let _ = emitter.event(
                                     frame::STATUS_EVENT,
@@ -311,10 +338,12 @@ impl RdpPlugin {
                                     ),
                                 );
                             }
+                            Err(_) => {}
                         }
+                        registry.remove(&id_for_worker);
                     });
                 if publish.is_err() {
-                    self.cleanup_handshake(connection_id);
+                    self.cleanup_handshake(connection_id, &cancel);
                     return Handshake::Failed("Failed to start handshake publisher".to_string());
                 }
                 Handshake::Running
@@ -365,12 +394,26 @@ impl RdpPlugin {
                 }
                 let handshake = self.begin_handshake(&params, connection_id, emitter);
                 match handshake {
-                    Handshake::Ready(session) => {
+                    Handshake::Ready(session, token) => {
+                        if token.load(Ordering::SeqCst) {
+                            let _ = session.shutdown.send(());
+                            self.cleanup_handshake(connection_id, &token);
+                            return Ok(
+                                json!({ "success": false, "message": "Connection was cancelled during handshake." }),
+                            );
+                        }
                         let info = session.info.clone();
+                        let dynamic = dynamic_mode(&params);
+                        let registered = register_session(session, dynamic);
+                        let ready = json!({"resizeMode": if dynamic { "dynamic" } else { "fixed" }, "sessionId": registered.id});
                         self.sessions
                             .lock()
                             .map_err(|_| PluginError::new(-32000, "Session registry is poisoned"))?
-                            .insert(connection_id.to_string(), session);
+                            .insert(connection_id.to_string(), registered);
+                        if let Some(emitter) = emitter {
+                            let _ = emitter.event(frame::STATUS_EVENT, frame::status_payload(connection_id, "session-ready", Some(ready)));
+                        }
+                        self.cleanup_handshake(connection_id, &token);
                         tracing::info!(
                             peer = %info.dial_host,
                             port = info.dial_port,
@@ -420,7 +463,7 @@ impl RdpPlugin {
                     .map_err(|_| PluginError::new(-32000, "Session registry is poisoned"))?
                     .remove(connection_id);
                 if let Some(session) = session {
-                    let _ = session.shutdown.send(());
+                    let _ = session.session.shutdown.send(());
                     // Do not join: the task exits on its own once the socket is
                     // closed; blocking would stall the worker pool.
                 }
@@ -438,14 +481,21 @@ impl RdpPlugin {
                     let width = params.get("width").and_then(Value::as_u64).unwrap_or(0) as u16;
                     let height = params.get("height").and_then(Value::as_u64).unwrap_or(0) as u16;
                     if width == 0 || height == 0 {
-                        return Ok(json!({ "success": false, "message": "resize requires width and height" }));
+                        return Ok(
+                            json!({ "success": false, "message": "resize requires width and height" }),
+                        );
                     }
                     let sent = self
                         .sessions
                         .lock()
                         .map_err(|_| PluginError::new(-32000, "Session registry is poisoned"))?
                         .get(connection_id)
-                        .map(|session| session.commands.send(SessionCommand::Resize { width, height }).is_ok())
+                        .map(|session| {
+                            session
+                                .session.commands
+                                .send(SessionCommand::Resize { width, height })
+                                .is_ok()
+                        })
                         .unwrap_or(false);
                     return Ok(json!({
                         "success": sent,
@@ -466,17 +516,47 @@ impl RdpPlugin {
 
     /// Binary input frames from the UI (channel "input").
     pub fn deliver_input(&self, message: InputMessage) {
-        let guard = match self.sessions.lock() {
-            Ok(guard) => guard,
-            Err(_) => return,
+        self.deliver_input_with_emitter(message, None);
+    }
+
+    fn deliver_input_with_emitter(&self, message: InputMessage, emitter: Option<&PluginEmitter>) {
+        let Ok(mut guard) = self.sessions.lock() else { return; };
+        let Some(registered) = guard.get_mut(&message.connection_id) else {
+            if matches!(message.event, InputKind::SessionReadyQuery) {
+                if let Some(emitter) = emitter {
+                    let _ = emitter.event(frame::STATUS_EVENT, frame::status_payload(&message.connection_id, "session-unavailable", None));
+                }
+            }
+            return;
         };
-        if let Some(session) = guard.get(&message.connection_id) {
-            let command = match message.event {
-                InputKind::Resize { width, height } => SessionCommand::Resize { width, height },
-                InputKind::ApplySize { width, height } => SessionCommand::ApplySize { width, height },
-                other => SessionCommand::Input(other),
-            };
-            let _ = session.commands.send(command);
+        let mut notification = None;
+        let command = match message.event {
+            InputKind::SessionReadyQuery => {
+                notification = Some(("session-ready", json!({"sessionId": registered.id, "resizeMode": if registered.dynamic { "dynamic" } else { "fixed" }})));
+                None
+            }
+            InputKind::InitialResize { width, height, session_id } => {
+                let valid = session_id.as_slice() == registered.id.as_bytes()
+                    && registered.dynamic && !registered.initial_resize_used
+                    && (256..=8192).contains(&width) && (200..=8192).contains(&height)
+                    && width % 4 == 0 && height % 4 == 0
+                    && u32::from(width) * u32::from(height) <= 3840 * 2160;
+                let accepted = valid && registered.session.commands.send(SessionCommand::ApplySize { width, height }).is_ok();
+                if accepted { registered.initial_resize_used = true; }
+                notification = Some(("initial-resize-result", json!({"sessionId": String::from_utf8_lossy(&session_id), "accepted": accepted})));
+                None
+            }
+            InputKind::ApplySize { width, height } => {
+                registered.initial_resize_used = true;
+                Some(SessionCommand::ApplySize { width, height })
+            }
+            InputKind::Resize { width, height } => Some(SessionCommand::Resize { width, height }),
+            other => Some(SessionCommand::Input(other)),
+        };
+        if let Some(command) = command { let _ = registered.session.commands.send(command); }
+        drop(guard);
+        if let (Some(emitter), Some((state, detail))) = (emitter, notification) {
+            let _ = emitter.event(frame::STATUS_EVENT, frame::status_payload(&message.connection_id, state, Some(detail)));
         }
     }
 }
@@ -496,14 +576,17 @@ impl PluginHandler for RdpPlugin {
         &self,
         channel: &str,
         data: Vec<u8>,
-        _emitter: &PluginEmitter,
+        emitter: &PluginEmitter,
     ) -> Result<(), PluginError> {
         if channel != frame::INPUT_CHANNEL {
-            return Err(PluginError::new(-32601, format!("Unknown binary channel: {channel}")));
+            return Err(PluginError::new(
+                -32601,
+                format!("Unknown binary channel: {channel}"),
+            ));
         }
         let message = frame::parse_input(&data)
             .map_err(|error| PluginError::new(-32600, format!("Malformed input frame: {error}")))?;
-        self.deliver_input(message);
+        self.deliver_input_with_emitter(message, Some(emitter));
         Ok(())
     }
 }
@@ -529,7 +612,11 @@ fn validate_form(params: &Value) -> Vec<String> {
     let mut problems = Vec::new();
     let connection = params.get("connection").cloned().unwrap_or_default();
 
-    let host = connection.get("host").and_then(Value::as_str).unwrap_or("").trim();
+    let host = connection
+        .get("host")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
     if host.is_empty() {
         problems.push("Host is required.".to_string());
     }
@@ -542,7 +629,11 @@ fn validate_form(params: &Value) -> Vec<String> {
         Some(_) => {}
     }
 
-    let username = connection.get("username").and_then(Value::as_str).unwrap_or("").trim();
+    let username = connection
+        .get("username")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
     if username.is_empty() {
         problems.push("Username is required.".to_string());
     }

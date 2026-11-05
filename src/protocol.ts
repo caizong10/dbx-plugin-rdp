@@ -2,6 +2,7 @@
 // Keep both files byte-compatible when changing either.
 
 export const FRAME_MAGIC = "RDP1";
+export const FRAME_MAGIC_GENERATION = "RDP2";
 export const INPUT_CHANNEL = "input";
 export const FRAME_CHANNEL = "frame";
 
@@ -14,6 +15,7 @@ export interface FrameHead {
   width: number;
   height: number;
   seq: number;
+  generation: number;
   pixels: Uint8Array;
 }
 
@@ -22,11 +24,14 @@ const decoder = new TextDecoder();
 
 export function parseFrame(data: Uint8Array): FrameHead | null {
   if (data.length < 4 + 1 + 17) return null;
-  if (decoder.decode(data.subarray(0, 4)) !== FRAME_MAGIC) return null;
+  const magic = decoder.decode(data.subarray(0, 4));
+  if (magic !== FRAME_MAGIC && magic !== FRAME_MAGIC_GENERATION) return null;
+  const hasGeneration = magic === FRAME_MAGIC_GENERATION;
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
   const idLen = data[4];
   const idEnd = 5 + idLen;
-  if (data.length < idEnd + 17) return null;
+  const headerLength = 17 + (hasGeneration ? 4 : 0);
+  if (data.length < idEnd + headerLength) return null;
   const connectionId = decoder.decode(data.subarray(5, idEnd));
   let at = idEnd;
   const readU16 = () => {
@@ -43,18 +48,13 @@ export function parseFrame(data: Uint8Array): FrameHead | null {
   const height = readU16();
   const seq = view.getUint32(at);
   at += 4;
-  if (format !== 0) return null;
-  return {
-    connectionId,
-    desktopWidth,
-    desktopHeight,
-    x,
-    y,
-    width,
-    height,
-    seq,
-    pixels: data.subarray(at),
-  };
+  const generation = hasGeneration ? view.getUint32(at) : 0;
+  if (hasGeneration) at += 4;
+  if (format !== 0 || desktopWidth === 0 || desktopHeight === 0 || width === 0 || height === 0) return null;
+  if (x + width > desktopWidth || y + height > desktopHeight) return null;
+  const pixels = data.subarray(at);
+  if (pixels.length !== width * height * 4) return null;
+  return { connectionId, desktopWidth, desktopHeight, x, y, width, height, seq, generation, pixels };
 }
 
 function pushId(target: number[], connectionId: string) {
@@ -121,12 +121,36 @@ export function applySizePacket(connectionId: string, width: number, height: num
   return new Uint8Array(body);
 }
 
+/** Initial automatic sizing, atomically deduplicated by the backend session. */
+export function sessionReadyPacket(connectionId: string): Uint8Array {
+  const body: number[] = [];
+  pushId(body, connectionId);
+  body.push(9);
+  return new Uint8Array(body);
+}
+
+export function initialSizePacket(connectionId: string, width: number, height: number, sessionId: string): Uint8Array {
+  const body: number[] = [];
+  pushId(body, connectionId);
+  body.push(8, ...u16(width), ...u16(height));
+  pushId(body, sessionId);
+  return new Uint8Array(body);
+}
+
 /// kind 6: the user pressed the workbench's "pull remote files" button —
 /// the sidecar re-arms the deferred offer and restarts the background pull.
 export function pullFilesPacket(connectionId: string): Uint8Array {
   const body: number[] = [];
   pushId(body, connectionId);
   body.push(6);
+  return new Uint8Array(body);
+}
+
+/** kind 7: retry an existing session after its automatic reconnect budget. */
+export function retryPacket(connectionId: string): Uint8Array {
+  const body: number[] = [];
+  pushId(body, connectionId);
+  body.push(7);
   return new Uint8Array(body);
 }
 

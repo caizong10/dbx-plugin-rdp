@@ -12,7 +12,7 @@
 
 use std::io::Write as _;
 use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -48,6 +48,7 @@ struct SessionParams {
     password: String,
     domain: Option<String>,
     color_depth: u8,
+    frame_generation: Arc<AtomicU64>,
     ignore_cert: bool,
     /// 1 = dynamic resize allowed, 0 = pinned. Cleared after the first
     /// reconnect-with-new-size fallback so a server without DisplayControl
@@ -108,15 +109,14 @@ impl ConnectEngine for IronRdpEngine {
             username,
             password: password.to_string(),
             domain: config_str(connection, "domain").filter(|value| !value.is_empty()),
-            color_depth: config_str(connection, "color_depth")
-                .and_then(|value| value.parse::<u8>().ok())
-                .unwrap_or(16),
+            color_depth: requested_color_depth(connection)?,
+            frame_generation: Arc::new(AtomicU64::new(0)),
             ignore_cert: config_bool(connection, "ignore_cert"),
             dynamic_resize: AtomicU8::new(
                 u8::from(config_str(connection, "resize_mode").as_deref() != Some("fixed")),
             ),
-            width: AtomicU16::new(config_u64(connection, "width").unwrap_or(1280) as u16),
-            height: AtomicU16::new(config_u64(connection, "height").unwrap_or(800) as u16),
+            width: AtomicU16::new(config_u64(connection, "width").unwrap_or(1920) as u16),
+            height: AtomicU16::new(config_u64(connection, "height").unwrap_or(1080) as u16),
             resize_pending: AtomicU8::new(0),
             clip_tx,
             remote_text_format: Arc::new(AtomicU32::new(0)),
@@ -184,6 +184,7 @@ fn open_session(
         params.domain.clone(),
         width,
         height,
+        params.color_depth,
     );
     let mut connector = ironrdp_connector::ClientConnector::new(config, client_addr);
     connector = connector.with_static_channel(ironrdp_dvc::DrdynvcClient::new().with_dynamic_channel(
@@ -272,14 +273,20 @@ fn open_session(
     )
     .map_err(|e| ConnectFailure(describe_negotiation_failure(&e)))?;
 
+    // IronRDP 0.10 exposes the requested depth in Config/BitmapConfig, while
+    // ConnectionResult exposes negotiated desktop dimensions and compression,
+    // but not a server-selected bpp. Keep these fields explicit: `requested`
+    // is what we sent; `actual` is only present when the protocol library can
+    // prove it. Never infer actual bpp from the requested value.
     let negotiated_width = connection_result.desktop_size.width;
     let negotiated_height = connection_result.desktop_size.height;
     params.width.store(negotiated_width, Ordering::Relaxed);
     params.height.store(negotiated_height, Ordering::Relaxed);
-    params.resize_pending.store(0, Ordering::Relaxed);
+    let resize_ack = params.resize_pending.swap(0, Ordering::Relaxed) == 1;
     let compression = format!("{:?}", connection_result.compression_type).to_lowercase();
     tracing::info!(
-        "RDP handshake complete: security=NLA/TLS peer={peer_addr} desktop={negotiated_width}x{negotiated_height} compression={compression} cert_fingerprint={fingerprint_display}"
+        "RDP handshake complete: security=NLA/TLS peer={peer_addr} desktop={negotiated_width}x{negotiated_height} requested_color_depth={} actual_color_depth=unknown decoded_pixel_format=RGBA32 compression={compression} cert_fingerprint={fingerprint_display}",
+        params.color_depth
     );
 
     let info = SessionInfo {
@@ -291,10 +298,14 @@ fn open_session(
         compression,
     };
 
+    // Invalidate old pumps before announcing a reconnected desktop. A write
+    // already in progress may still complete; the frame gate orders it before
+    // any frame from the new pump.
+    let generation = params.frame_generation.fetch_add(1, Ordering::SeqCst).wrapping_add(1) as u32;
     if let Some(emitter) = emitter {
         let _ = emitter.event(
             frame::STATUS_EVENT,
-            frame::status_payload(&params.connection_id, "connected", None),
+            frame::status_payload(&params.connection_id, "connected", Some(serde_json::json!({"generation": generation}))),
         );
         let _ = emitter.event(
             frame::DESKTOP_EVENT,
@@ -302,6 +313,11 @@ fn open_session(
                 "connectionId": params.connection_id,
                 "width": negotiated_width,
                 "height": negotiated_height,
+                "generation": generation,
+                "resizeAck": resize_ack,
+                "requestedColorDepth": params.color_depth,
+                "actualColorDepth": Value::Null,
+                "decodedPixelFormat": "RGBA32",
             }),
         );
     }
@@ -380,6 +396,35 @@ macro_rules! clip_op {
     }};
 }
 
+fn emit_resize_fallback(emitter: Option<&PluginEmitter>, params: &SessionParams, reason: &str) {
+    if let Some(emitter) = emitter {
+        let _ = emitter.event(
+            frame::STATUS_EVENT,
+            frame::status_payload(&params.connection_id, "resize-failed", Some(serde_json::json!({
+                "message": reason, "fallback": "reconnect-once"
+            }))),
+        );
+    }
+    tracing::warn!("resize fallback: {reason}");
+}
+
+fn is_pure_mouse_move(kind: &InputKind) -> bool {
+    matches!(kind, InputKind::Mouse { flags: 0x0800, .. })
+}
+
+fn wait_for_retry(commands: &mpsc::Receiver<SessionCommand>, shutdown: &mpsc::Receiver<()>) -> bool {
+    loop {
+        if shutdown.try_recv().is_ok() {
+            return false;
+        }
+        match commands.recv_timeout(Duration::from_millis(100)) {
+            Ok(SessionCommand::Input(InputKind::Retry)) => return true,
+            Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return false,
+        }
+    }
+}
+
 fn session_supervisor(
     params: Arc<SessionParams>,
     framed: UpgradedFramed,
@@ -401,8 +446,10 @@ fn session_supervisor(
             Some(pair) => pair,
             None => {
                 // Transport died or a resize needs a fresh desktop: reconnect
-                // with exponential backoff, bounded so dead endpoints cannot
-                // loop forever without user intent.
+                // with exponential backoff. After the bounded ladder is
+                // exhausted, keep this same supervisor alive and wait for the
+                // explicit kind-7 Retry command instead of leaving a dead
+                // command sender in the session registry.
                 loop {
                     if shutdown.try_recv().is_ok() {
                         emit_status(&emitter, &params, "disconnected", None);
@@ -425,8 +472,14 @@ fn session_supervisor(
                             tracing::warn!("reconnect attempt {attempt} failed: {}", error.0);
                             emit_status(&emitter, &params, "retry-failed", Some(attempt));
                             if attempt >= 10 {
-                                emit_status(&emitter, &params, "disconnected", None);
-                                return;
+                                emit_status(&emitter, &params, "retry-exhausted", Some(attempt));
+                                if !wait_for_retry(&commands, &shutdown) {
+                                    emit_status(&emitter, &params, "disconnected", None);
+                                    return;
+                                }
+                                attempt = 0;
+                                backoff = Duration::ZERO;
+                                user_initiated = true;
                             }
                         }
                     }
@@ -478,10 +531,15 @@ fn session_supervisor(
 /// filled the host pipe, the session thread blocked inside emitter.binary(),
 /// and neither socket reads nor queued input were processed until the pipe
 /// drained — experienced as "mouse disconnects while scrolling". When the
-/// queue exceeds its byte budget the oldest frames are dropped so the newest
-/// pixels always go out: a stale band is a cosmetic artifact, a stalled
-/// session is not.
+/// queue exceeds its byte budget, replace the pending updates with a complete
+/// framebuffer snapshot. A snapshot may exceed the normal queue budget; this
+/// bounds recovery memory by one desktop rather than losing pixels permanently.
 const FRAME_QUEUE_BYTES: usize = 24 * 1024 * 1024;
+
+// Serialize frame writes across pump generations. A stopped pump waiting for
+// this gate rechecks its stop flag before writing, so it cannot overtake a new
+// pump. An already-started write must finish before the new pump can write.
+static FRAME_WRITE_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub struct FramePump {
     state: Arc<PumpState>,
@@ -494,7 +552,8 @@ struct PumpState {
 }
 
 impl FramePump {
-    fn spawn(emitter: PluginEmitter) -> Self {
+    fn spawn(emitter: PluginEmitter, generation: Arc<AtomicU64>) -> Self {
+        let current_generation = generation.load(Ordering::SeqCst);
         let state = Arc::new(PumpState {
             queue: std::sync::Mutex::new((std::collections::VecDeque::new(), 0usize)),
             cvar: std::sync::Condvar::new(),
@@ -519,6 +578,12 @@ impl FramePump {
                     guard.1 -= frame.len();
                     frame
                 };
+                let _gate = FRAME_WRITE_GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if pump_state.stop.load(Ordering::SeqCst)
+                    || generation.load(Ordering::SeqCst) != current_generation
+                {
+                    return;
+                }
                 if emitter.binary(frame::FRAME_CHANNEL, &frame).is_err() {
                     return; // host pipe gone; session teardown will stop us
                 }
@@ -526,24 +591,29 @@ impl FramePump {
         Self { state }
     }
 
-    fn push(&self, bytes: Vec<u8>) {
+    fn push(&self, bytes: Vec<u8>) -> bool {
         if self.state.stop.load(Ordering::Relaxed) {
-            return;
+            return false;
         }
         let mut guard = self
             .state
             .queue
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // Drop whole oldest frames until the new one fits within budget.
-        while guard.1 + bytes.len() > FRAME_QUEUE_BYTES {
-            match guard.0.pop_front() {
-                Some(old) => guard.1 -= old.len(),
-                None => break,
-            }
+        if guard.1.saturating_add(bytes.len()) > FRAME_QUEUE_BYTES {
+            return false;
         }
         guard.1 += bytes.len();
         guard.0.push_back(bytes);
+        drop(guard);
+        self.state.cvar.notify_one();
+        true
+    }
+
+    fn replace_with_snapshot(&self, frames: Vec<Vec<u8>>) {
+        let mut guard = self.state.queue.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.1 = frames.iter().map(Vec::len).sum();
+        guard.0 = frames.into();
         drop(guard);
         self.state.cvar.notify_one();
     }
@@ -638,10 +708,14 @@ fn run_active_session(
 
     // Decouple frame delivery from this thread so a burst of graphics updates
     // (fast scrolling) can never block socket reads or input handling.
-    let pump = emitter.map(|emitter| FramePump::spawn(emitter.clone()));
+    let generation = params.frame_generation.load(Ordering::SeqCst) as u32;
+    let pump = emitter.map(|emitter| FramePump::spawn(emitter.clone(), Arc::clone(&params.frame_generation)));
 
     let activation_factory = connection_result.activation_factory.clone();
     let mut seq_counter: u32 = 0;
+    if let Some(pump) = &pump {
+        emit_full_frame(pump, params, &image, seq_counter, generation);
+    }
     // Lazily (re)built: a transient arboard failure must not disable clipboard
     // sync for the whole session lifetime.
     let mut clipboard: Option<arboard::Clipboard> = None;
@@ -702,6 +776,7 @@ fn run_active_session(
         }
     }
     let _clipboard_session = ClipboardSessionGuard;
+    let mut apply_pending: Option<((u16, u16), Instant)> = None;
 
     loop {
         if shutdown.try_recv().is_ok() {
@@ -717,11 +792,13 @@ fn run_active_session(
         }
         let mut index = 0usize;
         while index < batch.len() {
-            let is_move = matches!(batch[index], SessionCommand::Input(InputKind::Mouse { .. }));
+            // Only a pure MOVE is replaceable. Button transitions, wheel
+            // events, and a MOVE combined with another flag are semantic input
+            // and must retain their order.
+            let is_move = matches!(&batch[index], SessionCommand::Input(kind) if is_pure_mouse_move(kind));
             if is_move {
-                // Collapse the run of consecutive moves down to the last.
                 while index + 1 < batch.len()
-                    && matches!(batch[index + 1], SessionCommand::Input(InputKind::Mouse { .. }))
+                    && matches!(&batch[index + 1], SessionCommand::Input(kind) if is_pure_mouse_move(kind))
                 {
                     index += 1;
                 }
@@ -802,16 +879,45 @@ fn run_active_session(
                     }
                 }
                 SessionCommand::ApplySize { width, height } => {
-                    // Explicit user action (Apply button): pin the session to
-                    // this desktop size and reconnect right away, no backoff.
+                    let requested = (*width, *height);
+                    if requested == (image.width(), image.height()) && apply_pending.is_none() {
+                        if let Some(emitter) = emitter {
+                            let _ = emitter.event(frame::DESKTOP_EVENT, serde_json::json!({
+                                "connectionId": params.connection_id, "width": width, "height": height, "resizeAck": true
+                            }));
+                            let _ = emitter.event(frame::STATUS_EVENT, frame::status_payload(&params.connection_id, "connected", None));
+                        }
+                        index += 1;
+                        continue;
+                    }
                     params.width.store(*width, Ordering::Relaxed);
                     params.height.store(*height, Ordering::Relaxed);
-                    params.dynamic_resize.store(0, Ordering::Relaxed);
-                    tracing::info!("apply size requested by user: {width}x{height}; reconnecting now");
-                    return SessionEnd::ApplySize;
+                    params.resize_pending.store(1, Ordering::Relaxed);
+                    if let Some(emitter) = emitter {
+                        let _ = emitter.event(frame::STATUS_EVENT, frame::status_payload(&params.connection_id, "resizing", None));
+                    }
+                    match active_stage.encode_resize(u32::from(*width), u32::from(*height), None, None) {
+                        Some(Ok(frames)) => {
+                            if let Err(error) = framed.write_all(&frames) {
+                                return SessionEnd::Lost(format!("resize write: {error}"));
+                            }
+                            apply_pending = Some((requested, Instant::now() + Duration::from_secs(8)));
+                        }
+                        _ => {
+                            params.dynamic_resize.store(0, Ordering::Relaxed);
+                            emit_resize_fallback(emitter, params, "DisplayControl unavailable or rejected request");
+                            return SessionEnd::ApplySize;
+                        }
+                    }
                 }
             }
             index += 1;
+        }
+
+        if apply_pending.is_some_and(|(_, deadline)| Instant::now() >= deadline) {
+            params.dynamic_resize.store(0, Ordering::Relaxed);
+            emit_resize_fallback(emitter, params, "DisplayControl activation timed out");
+            return SessionEnd::ApplySize;
         }
 
         // Clipboard pump: commands queued by the CLIPRDR backend.
@@ -1340,7 +1446,7 @@ fn run_active_session(
                                 ActiveStageOutput::GraphicsUpdate(rect) => {
                                     if let Some(pump) = &pump {
                                         seq_counter = seq_counter.wrapping_add(1);
-                                        emit_dirty_rect(pump, params, &image, &rect, seq_counter);
+                                        emit_dirty_rect(pump, params, &image, &rect, seq_counter, generation);
                                     }
                                 }
                                 ActiveStageOutput::ResponseFrame(frame) => {
@@ -1354,7 +1460,12 @@ fn run_active_session(
                                 }
                                 ActiveStageOutput::DeactivateAll => {
                                     tracing::info!("Deactivation-Reactivation sequence started");
-                                    match run_activation_sequence(framed, &activation_factory) {
+                                    // Reactivation is a handshake, not an idle input poll.
+                                    // Restore the short timeout after the bounded handshake.
+                                    let _ = framed.get_inner_mut().0.sock.set_read_timeout(Some(Duration::from_secs(8)));
+                                    let activation = run_activation_sequence(framed, &activation_factory);
+                                    let _ = framed.get_inner_mut().0.sock.set_read_timeout(Some(Duration::from_millis(5)));
+                                    match activation {
                                         Ok(desktop) => {
                                             image = ironrdp_session::image::DecodedImage::new(
                                                 PixelFormat::RgbA32,
@@ -1364,6 +1475,9 @@ fn run_active_session(
                                             params.width.store(desktop.0, Ordering::Relaxed);
                                             params.height.store(desktop.1, Ordering::Relaxed);
                                             let had_resize = params.resize_pending.swap(0, Ordering::Relaxed) == 1;
+                                            if had_resize {
+                                                apply_pending = None;
+                                            }
                                             if let Some(emitter) = emitter {
                                                 let _ = emitter.event(
                                                     frame::DESKTOP_EVENT,
@@ -1371,14 +1485,19 @@ fn run_active_session(
                                                         "connectionId": params.connection_id,
                                                         "width": desktop.0,
                                                         "height": desktop.1,
+                                                        "generation": generation,
                                                         "resizeAck": had_resize,
                                                     }),
                                                 );
                                             }
                                             if let Some(pump) = &pump {
                                                 seq_counter += 1;
-                                                emit_full_frame(pump, params, &image, seq_counter);
+                                                emit_full_frame(pump, params, &image, seq_counter, generation);
                                             }
+                                        }
+                                        Err(error) if apply_pending.is_some() => {
+                                            emit_resize_fallback(emitter, params, &error);
+                                            return SessionEnd::ApplySize;
                                         }
                                         Err(error) => return SessionEnd::Lost(error),
                                     }
@@ -1539,14 +1658,20 @@ fn emit_dirty_rect(
     image: &ironrdp_session::image::DecodedImage,
     rect: &ironrdp_pdu::geometry::InclusiveRectangle,
     seq: u32,
+    generation: u32,
 ) {
     let x = rect.left;
     let y = rect.top;
     let width = rect.right - rect.left + 1;
     let height = rect.bottom - rect.top + 1;
     let (dw, dh) = (image.width(), image.height());
-    for (tx, ty, tw, th) in frame::tile_rect(dw, dh, (x, y, width, height)) {
-        emit_tile(pump, params, image, (tx, ty, tw, th), dw, dh, seq);
+    for tile in frame::tile_rect(dw, dh, (x, y, width, height)) {
+        if let Some(bytes) = encode_tile(params, image, tile, seq, generation) {
+            if !pump.push(bytes) {
+                emit_full_frame(pump, params, image, seq, generation);
+                break;
+            }
+        }
     }
 }
 
@@ -1555,25 +1680,27 @@ fn emit_full_frame(
     params: &SessionParams,
     image: &ironrdp_session::image::DecodedImage,
     seq: u32,
+    generation: u32,
 ) {
     let (dw, dh) = (image.width(), image.height());
-    for (tx, ty, tw, th) in frame::tile_rect(dw, dh, (0, 0, dw, dh)) {
-        emit_tile(pump, params, image, (tx, ty, tw, th), dw, dh, seq);
+    let frames: Option<Vec<_>> = frame::tile_rect(dw, dh, (0, 0, dw, dh))
+        .into_iter().map(|tile| encode_tile(params, image, tile, seq, generation)).collect();
+    if let Some(frames) = frames {
+        pump.replace_with_snapshot(frames);
     }
 }
 
-fn emit_tile(
-    pump: &FramePump,
+fn encode_tile(
     params: &SessionParams,
     image: &ironrdp_session::image::DecodedImage,
     rect: (u16, u16, u16, u16),
-    dw: u16,
-    dh: u16,
     seq: u32,
-) {
+    generation: u32,
+) -> Option<Vec<u8>> {
+    let (dw, dh) = (image.width(), image.height());
     let (x, y, w, h) = rect;
     if w == 0 || h == 0 || dw == 0 || dh == 0 {
-        return;
+        return None;
     }
     // Copy the tile out of the framebuffer row by row: `data_for_rect` exposes
     // a strided view, but the frame contract requires a tight w*h*4 payload.
@@ -1588,19 +1715,20 @@ fn emit_tile(
         let start = row as usize * stride + x as usize * 4;
         let end = start + columns;
         if end > source.len() {
-            return;
+            return None;
         }
         pixels.extend_from_slice(&source[start..end]);
     }
-    pump.push(frame::encode_frame(
+    Some(frame::encode_frame(
         &params.connection_id,
         dw,
         dh,
         frame::FORMAT_RGBA32,
         (x, y, w, h),
         seq,
+        generation,
         &pixels,
-    ));
+    ))
 }
 
 /// Convert a wire input event into fast-path events. Move throttling lives in
@@ -1659,7 +1787,12 @@ fn input_to_fastpath(
             }
             Some(vec![FastPathInputEvent::UnicodeKeyboardEvent(kb, *code)])
         }
-        InputKind::Resize { .. } | InputKind::ApplySize { .. } | InputKind::PullFiles => None,
+        InputKind::Resize { .. }
+        | InputKind::ApplySize { .. }
+        | InputKind::PullFiles
+        | InputKind::Retry
+        | InputKind::InitialResize { .. }
+        | InputKind::SessionReadyQuery => None,
     }
 }
 
@@ -1671,6 +1804,7 @@ fn build_config(
     domain: Option<String>,
     width: u16,
     height: u16,
+    color_depth: u8,
 ) -> ironrdp_connector::Config {
     ironrdp_connector::Config {
         credentials: ironrdp_connector::Credentials::UsernamePassword { username, password },
@@ -1686,7 +1820,11 @@ fn build_config(
         keyboard_functional_keys_count: 12,
         keyboard_layout: 0,
         ime_file_name: String::new(),
-        bitmap: None,
+        bitmap: Some(ironrdp_connector::BitmapConfig {
+            lossy_compression: false,
+            color_depth: u32::from(color_depth),
+            codecs: Default::default(),
+        }),
         dig_product_id: String::new(),
         client_dir: "C:\\Windows\\System32\\mstscax.dll".to_owned(),
         alternate_shell: String::new(),
@@ -1828,6 +1966,18 @@ fn field_str(connection: &Value, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+fn requested_color_depth(connection: &Value) -> Result<u8, ConnectFailure> {
+    match config_str(connection, "color_depth").as_deref() {
+        // 32-bit is the backend default when the host omits the optional field.
+        None | Some("32") => Ok(32),
+        Some("16") => Ok(16),
+        Some("24") => Ok(24),
+        Some(_) => Err(ConnectFailure(
+            "Unsupported color depth; expected 16, 24, or 32.".to_string(),
+        )),
+    }
+}
+
 fn config_str(connection: &Value, key: &str) -> Option<String> {
     connection
         .get("external_config")
@@ -1849,4 +1999,35 @@ fn config_bool(connection: &Value, key: &str) -> bool {
         .and_then(|config| config.get(key))
         .and_then(Value::as_bool)
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod color_depth_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn requested_depth_defaults_to_32_and_preserves_explicit_choices() {
+        for (connection, expected) in [
+            (json!({}), 32),
+            (json!({"external_config": {}}), 32),
+            (json!({"external_config": {"color_depth": "16"}}), 16),
+            (json!({"external_config": {"color_depth": "24"}}), 24),
+            (json!({"external_config": {"color_depth": "32"}}), 32),
+        ] {
+            let depth = requested_color_depth(&connection).ok().unwrap();
+            assert_eq!(depth, expected);
+            let config = build_config("user".into(), "password".into(), None, 1280, 800, depth);
+            let bitmap = config.bitmap.unwrap();
+            assert_eq!(bitmap.color_depth, u32::from(expected));
+            assert!(bitmap.codecs.0.is_empty(), "do not advertise unverified bitmap codecs");
+            assert!(!bitmap.lossy_compression);
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_color_depth() {
+        let result = requested_color_depth(&json!({"external_config": {"color_depth": "8"}}));
+        assert!(matches!(result, Err(ConnectFailure(message)) if message.contains("16, 24, or 32")));
+    }
 }

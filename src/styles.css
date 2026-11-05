@@ -21,8 +21,9 @@ body {
 #app {
   display: flex;
   flex-direction: column;
-  min-height: 100vh;
+  min-height: 0;
   height: 100vh;
+  overflow: hidden;
   padding: 8px 12px;
   gap: 8px;
 }
@@ -46,6 +47,14 @@ body {
   display: flex;
   align-items: center;
   gap: 10px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.scale-notice,
+.resize-diagnostics {
+  color: var(--color-muted-foreground, #6b7280);
+  font-size: 12px;
 }
 
 .pick {
@@ -72,8 +81,10 @@ body {
   min-height: 200px;
   border: 1px solid color-mix(in srgb, currentColor 18%, transparent);
   border-radius: 10px;
-  overflow: auto;
+  overflow: hidden;
   background: color-mix(in srgb, currentColor 6%, transparent);
+  display: grid;
+  place-items: center;
 }
 
 #screen {
@@ -129,20 +140,6 @@ body {
 
 .dbx-btn:hover { filter: brightness(0.96); }
 .dbx-btn:disabled { opacity: 0.55; cursor: wait; }
-
-/* Hidden input that owns IME composition without disturbing the canvas. */
-.ime {
-  position: absolute;
-  bottom: 0;
-  left: 0;
-  width: 2px;
-  height: 2px;
-  opacity: 0;
-  border: 0;
-  padding: 0;
-  resize: none;
-  overflow: hidden;
-}
 
 /* File-transfer status toast, bottom-left mirror of the reconnect bar. */
 .clip-toast {

@@ -70,6 +70,8 @@ describe("manifest contract (fact sheet §3/§4)", () => {
       expect(f?.visible_when).toEqual({ field: "resize_mode", one_of: ["fixed"] });
     }
     const depth = field("color_depth");
+    expect(depth?.default).toBe("32");
+    expect(depth?.binding).toBe("config");
     expect(depth?.options?.map((o: any) => o.value).sort()).toEqual(["16", "24", "32"]);
   });
 

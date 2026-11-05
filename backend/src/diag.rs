@@ -1,11 +1,7 @@
 //! Minimal file-based diagnostics for the clipboard (CLIPRDR) channel.
 //!
-//! The host captures sidecar stderr nowhere persistent and this machine's
-//! copy of the password is stored encrypted, so a developer cannot reproduce
-//! the live handshake locally. This module writes a short, structured trace
-//! to the plugin data directory that the developer can read after a single
-//! real connection. It records channel IDs and protocol milestones only —
-//! never credentials, never clipboard contents (text is logged as a length).
+//! Optional structured traces of channel IDs and protocol milestones. This is
+//! disabled by default and never records clipboard contents or credentials.
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -27,6 +23,7 @@ fn log_path() -> PathBuf {
 /// Append one line with a microsecond timestamp. Best-effort: a diagnostic
 /// failure must never affect the session, so all errors are swallowed.
 pub fn note(message: &str) {
+    if std::env::var("DBX_RDP_CLIP_DIAG").as_deref() != Ok("1") { return; }
     let _guard = LOCK.lock().ok();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -44,6 +41,7 @@ pub fn note(message: &str) {
 
 /// Truncate the log at session start so each connection yields a clean trace.
 pub fn reset() {
+    if std::env::var("DBX_RDP_CLIP_DIAG").as_deref() != Ok("1") { return; }
     let _guard = LOCK.lock().ok();
     SEQ.store(0, Ordering::Relaxed);
     let _ = std::fs::write(log_path(), "");

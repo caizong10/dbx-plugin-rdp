@@ -9,6 +9,13 @@
 /dbx-repository-signing-key.env
 .DS_Store
 *.log
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+/NUL
 
 # Per-machine cargo override. The committed reference is
 # `.cargo/config.toml.example`; cargo walks up from the working directory, so

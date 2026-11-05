@@ -4,8 +4,8 @@ use dbx_plugin_rdp::frame;
 
 #[test]
 fn frame_header_layout_is_stable() {
-    // 'RDP1' | connLen u8 | connId | desktopW u16 | desktopH u16 | format u8
-    //      | x y w h u16 each | seq u32 | RGBA pixels
+    // 'RDP2' | connLen u8 | connId | desktopW u16 | desktopH u16 | format u8
+    //      | x y w h u16 each | seq u32 | generation u32 | RGBA pixels
     let frame = frame::encode_frame(
         "conn-7",
         1280,
@@ -13,9 +13,10 @@ fn frame_header_layout_is_stable() {
         frame::FORMAT_RGBA32,
         (0, 0, 1280, 800),
         42,
+        3,
         &[9, 9, 9, 9],
     );
-    assert_eq!(&frame[0..4], b"RDP1");
+    assert_eq!(&frame[0..4], b"RDP2");
     assert_eq!(frame[4], 6); // connLen("conn-7")
     assert_eq!(&frame[5..11], b"conn-7");
     assert_eq!(&frame[11..13], &1280u16.to_be_bytes());
@@ -26,24 +27,26 @@ fn frame_header_layout_is_stable() {
     assert_eq!(&frame[20..22], &1280u16.to_be_bytes()); // w
     assert_eq!(&frame[22..24], &800u16.to_be_bytes()); // h
     assert_eq!(&frame[24..28], &42u32.to_be_bytes());
-    assert_eq!(&frame[28..], &[9, 9, 9, 9]);
+    assert_eq!(&frame[28..32], &3u32.to_be_bytes());
+    assert_eq!(&frame[32..], &[9, 9, 9, 9]);
 }
 
 #[test]
 fn frame_roundtrip() {
     let pixels = vec![1u8; 2 * 2 * 4];
-    let bytes = frame::encode_frame("c1", 64, 32, frame::FORMAT_RGBA32, (8, 8, 2, 2), 7, &pixels);
+    let bytes = frame::encode_frame("c1", 64, 32, frame::FORMAT_RGBA32, (8, 8, 2, 2), 7, 3, &pixels);
     let head = frame::parse_header(&bytes).unwrap();
     assert_eq!(head.connection_id, "c1");
     assert_eq!((head.desktop_width, head.desktop_height), (64, 32));
     assert_eq!(head.rect, (8, 8, 2, 2));
     assert_eq!(head.seq, 7);
+    assert_eq!(head.generation, 3);
     assert_eq!(&bytes[head.pixels_offset..], &pixels[..]);
 }
 
 #[test]
 fn frame_rejects_bad_magic_and_truncated_input() {
-    let good = frame::encode_frame("c1", 4, 4, frame::FORMAT_RGBA32, (0, 0, 4, 4), 1, &[0; 64]);
+    let good = frame::encode_frame("c1", 4, 4, frame::FORMAT_RGBA32, (0, 0, 4, 4), 1, 1, &[0; 64]);
     let mut bad = good.clone();
     bad[0] = b'X';
     assert!(frame::parse_header(&bad).is_err());
@@ -126,6 +129,19 @@ fn unicode_input_packet_roundtrips() {
         }
         other => panic!("expected unicode, got {other:?}"),
     }
+}
+
+#[test]
+fn retry_input_kind_is_a_payload_free_control_event() {
+    // connLen | connectionId | kind 7; this is the binary contract used by
+    // the workbench Retry button and intentionally carries no retry payload.
+    let packet = [1u8, b'c', 7u8];
+    let parsed = frame::parse_input(&packet).unwrap();
+    assert_eq!(parsed.connection_id, "c");
+    assert_eq!(parsed.event, frame::InputKind::Retry);
+
+    let with_payload = [1u8, b'c', 7u8, 0];
+    assert!(frame::parse_input(&with_payload).is_err());
 }
 
 #[test]

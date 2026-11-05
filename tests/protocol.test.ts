@@ -8,10 +8,13 @@ import {
   PTR_DOWN,
   PTR_MOVE,
   acceptFrame,
+  initialSizePacket,
   keyPacket,
   mousePacket,
   parseFrame,
   resizePacket,
+  retryPacket,
+  sessionReadyPacket,
   unicodePacket,
   wheelPacket,
 } from "../src/protocol";
@@ -23,11 +26,12 @@ function encodeReferenceFrame(
   rect: [number, number, number, number],
   seq: number,
   pixels: Uint8Array,
+  generation?: number,
 ): Uint8Array {
   const id = new TextEncoder().encode(connectionId);
-  const head = new Uint8Array(4 + 1 + id.length + 17);
+  const head = new Uint8Array(4 + 1 + id.length + 17 + (generation === undefined ? 0 : 4));
   const view = new DataView(head.buffer);
-  head.set([0x52, 0x44, 0x50, 0x31], 0); // "RDP1"
+  head.set(generation === undefined ? [0x52, 0x44, 0x50, 0x31] : [0x52, 0x44, 0x50, 0x32], 0);
   head[4] = id.length;
   head.set(id, 5);
   let at = 5 + id.length;
@@ -35,7 +39,8 @@ function encodeReferenceFrame(
   view.setUint16(at, desktopHeight); at += 2;
   head[at++] = 0; // RGBA32
   for (const value of rect) { view.setUint16(at, value); at += 2; }
-  view.setUint32(at, seq);
+  view.setUint32(at, seq); at += 4;
+  if (generation !== undefined) view.setUint32(at, generation);
   const out = new Uint8Array(head.length + pixels.length);
   out.set(head, 0);
   out.set(pixels, head.length);
@@ -55,10 +60,24 @@ describe("frame decode", () => {
     expect(Array.from(frame!.pixels)).toEqual(Array.from(pixels));
   });
 
+  it("parses RDP2 generation after sequence and rejects a truncated generation", () => {
+    const data = encodeReferenceFrame("c1", 10, 10, [0, 0, 1, 1], 42, new Uint8Array(4), 7);
+    expect(parseFrame(data)?.generation).toBe(7);
+    expect(parseFrame(data)?.seq).toBe(42);
+    expect(parseFrame(data.subarray(0, data.length - 5))).toBeNull();
+  });
+
   it("rejects a truncated frame", () => {
     const pixels = new Uint8Array(4).fill(1);
     const data = encodeReferenceFrame("c1", 10, 10, [0, 0, 1, 1], 1, pixels);
     expect(parseFrame(data.subarray(0, 10))).toBeNull();
+    expect(parseFrame(data.subarray(0, data.length - 1))).toBeNull();
+    expect(parseFrame(new Uint8Array([...data, 0]))).toBeNull();
+  });
+
+  it("rejects empty and out-of-bounds rectangles", () => {
+    expect(parseFrame(encodeReferenceFrame("c1", 10, 10, [0, 0, 0, 1], 1, new Uint8Array()))).toBeNull();
+    expect(parseFrame(encodeReferenceFrame("c1", 10, 10, [9, 9, 2, 2], 1, new Uint8Array(16)))).toBeNull();
   });
 });
 
@@ -127,6 +146,23 @@ describe("input encoders", () => {
     const view = new DataView(body.buffer, body.byteOffset, body.byteLength);
     expect(kind).toBe(4);
     expect(view.getUint16(2)).toBe(0x4e2d);
+  });
+
+  it("retry packet is kind 7 with no payload", () => {
+    const { id, kind, body } = decodeHead(retryPacket("c1"));
+    expect(id).toBe("c1");
+    expect(kind).toBe(7);
+    expect(body.length).toBe(0);
+  });
+
+  it("encodes initial sizing and readiness query", () => {
+    const packet = decodeHead(initialSizePacket("c1", 1500, 1052, "s1"));
+    expect(packet.id).toBe("c1");
+    expect(packet.kind).toBe(8);
+    expect([...packet.body]).toEqual([0x05, 0xdc, 0x04, 0x1c, 2, 0x73, 0x31]);
+    const query = decodeHead(sessionReadyPacket("c1"));
+    expect(query.kind).toBe(9);
+    expect(query.body.length).toBe(0);
   });
 
   it("input channel name matches the sidecar contract", () => {

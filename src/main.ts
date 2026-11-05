@@ -1,5 +1,7 @@
 import type { BinaryEnvelope, DbxPluginBridge } from "./dbx";
-import { RELEASE_FLAG, isModifier, mapKey } from "./keymap";
+import { AutoSizeDecision } from "./auto-size";
+import { RELEASE_FLAG, mapKey } from "./keymap";
+import { fitLayout, fitResolution, remotePoint } from "./layout";
 import {
   INPUT_CHANNEL,
   PTR_BUTTON1,
@@ -9,10 +11,12 @@ import {
   PTR_MOVE,
   acceptFrame,
   applySizePacket,
+  initialSizePacket,
   keyPacket,
   mousePacket,
   pullFilesPacket,
-  unicodePacket,
+  retryPacket,
+  sessionReadyPacket,
   wheelPacket,
 } from "./protocol";
 
@@ -23,6 +27,7 @@ const canvasWrap = document.querySelector<HTMLElement>(".canvas-wrap")!;
 const canvas = document.querySelector<HTMLCanvasElement>("#screen")!;
 const overlay = document.querySelector<HTMLDivElement>("#overlay")!;
 const reconnectBar = document.querySelector<HTMLDivElement>("#reconnect")!;
+const reconnectNote = document.querySelector<HTMLSpanElement>(".reconnect-note")!;
 const clipToast = document.querySelector<HTMLDivElement>("#clip-toast")!;
 const pullFilesBtn = document.querySelector<HTMLButtonElement>("#pull-files")!;
 const retryBtn = document.querySelector<HTMLButtonElement>("#retry")!;
@@ -31,7 +36,6 @@ const resLabel = document.querySelector<HTMLSpanElement>("#res-label")!;
 const scaleSelect = document.querySelector<HTMLSelectElement>("#scale")!;
 const scaleLabel = document.querySelector<HTMLSpanElement>("#scale-label")!;
 const applyBtn = document.querySelector<HTMLButtonElement>("#apply")!;
-const imeInput = document.querySelector<HTMLTextAreaElement>("#ime")!;
 
 const ctx2d = canvas.getContext("2d", { alpha: false })!;
 
@@ -53,6 +57,10 @@ const COPY: Record<"en" | "zh", Record<string, string>> = {
     retry: "Retry now",
     lost: "Connection lost — retry with the button",
     connecting: "Connecting…",
+    connected: "Connected",
+    resizing: "Adjusting remote resolution…",
+    resizeFailed: "Resolution change failed",
+    resizeUnavailable: "The remote session did not accept the requested size",
     open: "Opening remote desktop…",
     frames: "Receiving screen…",
     noSession: "This workbench has no connection. Open it from a connection.",
@@ -70,6 +78,10 @@ const COPY: Record<"en" | "zh", Record<string, string>> = {
     retry: "立即重试",
     lost: "连接已断开 — 可点击按钮重试",
     connecting: "正在连接…",
+    connected: "已连接",
+    resizing: "正在调整远程分辨率…",
+    resizeFailed: "调整分辨率失败",
+    resizeUnavailable: "远程会话未接受请求的尺寸",
     open: "正在打开远程桌面…",
     frames: "正在接收画面…",
     noSession: "此工作台没有连接，请从连接项打开。",
@@ -95,6 +107,7 @@ let connectionId = "";
 let remoteWidth = 0;
 let remoteHeight = 0;
 let gotFrame = false;
+let frameGeneration = 0;
 
 // Off-screen copy of the remote framebuffer; the visible canvas scales it.
 const imageBuffer = document.createElement("canvas");
@@ -109,6 +122,13 @@ let lastPoint: [number, number] = [0, 0];
 function applyFrame(envelope: BinaryEnvelope): void {
   const frame = acceptFrame(envelope, connectionId);
   if (!frame) return;
+  if (frame.generation < frameGeneration) return;
+  if (frame.generation > frameGeneration) {
+    frameGeneration = frame.generation;
+    gotFrame = false;
+    imageCtx.clearRect(0, 0, imageBuffer.width, imageBuffer.height);
+    ctx2d.clearRect(0, 0, canvas.width, canvas.height);
+  }
   if (frame.desktopWidth !== remoteWidth || frame.desktopHeight !== remoteHeight) {
     remoteWidth = frame.desktopWidth;
     remoteHeight = frame.desktopHeight;
@@ -117,7 +137,6 @@ function applyFrame(envelope: BinaryEnvelope): void {
     canvas.width = remoteWidth;
     canvas.height = remoteHeight;
     applyScale();
-    paintPlaceholder();
   }
   if (frame.x + frame.width > remoteWidth || frame.y + frame.height > remoteHeight) return;
   const source = new ImageData(new Uint8ClampedArray(frame.pixels), frame.width, frame.height);
@@ -131,7 +150,9 @@ function applyFrame(envelope: BinaryEnvelope): void {
     gotFrame = true;
     overlay.textContent = "";
     reconnectBar.hidden = true;
+    scheduleAutoSize();
   }
+  updateDiagnostics();
 }
 
 // One pending dirty rectangle (union of tiles) flushed on the next frame.
@@ -163,12 +184,12 @@ function flushDirty(): void {
 }
 
 function drawRegion(x: number, y: number, width: number, height: number): void {
-  ctx2d.imageSmoothingEnabled = true;
+  ctx2d.imageSmoothingEnabled = false;
   ctx2d.drawImage(imageBuffer, x, y, width, height, x, y, width, height);
 }
 
 function drawToScreen(): void {
-  ctx2d.imageSmoothingEnabled = true;
+  ctx2d.imageSmoothingEnabled = false;
   ctx2d.clearRect(0, 0, canvas.width, canvas.height);
   ctx2d.drawImage(imageBuffer, 0, 0, canvas.width, canvas.height);
 }
@@ -177,44 +198,42 @@ function paintPlaceholder(): void {
   const styles = getComputedStyle(document.documentElement);
   ctx2d.fillStyle = styles.getPropertyValue("--color-background").trim() || "#ffffff";
   ctx2d.fillRect(0, 0, canvas.width, canvas.height);
-  ctx2d.fillStyle = styles.getPropertyValue("--color-muted-foreground").trim() || "#6b7280";
-  ctx2d.font = "14px sans-serif";
-  ctx2d.textAlign = "center";
-  ctx2d.fillText(t("frames"), canvas.width / 2, canvas.height / 2);
 }
 
 // ---------------------------------------------------------------- view scale
 
-// Scale is purely local: it changes how large the remote desktop is painted
-// on screen (with scrollbars when >100%), never the negotiated resolution.
+// Scale is local and capped at fit so the whole desktop remains visible.
+const scaleNotice = document.createElement("span");
+scaleNotice.className = "scale-notice";
+scaleNotice.setAttribute("role", "status");
+scaleNotice.hidden = true;
+scaleSelect.parentElement!.after(scaleNotice);
 function applyScale(): void {
-  const scale = Number(scaleSelect.value) || 1;
-  if (scale <= 1.001) {
-    canvas.style.width = "100%";
-    canvas.style.height = "100%";
-  } else {
-    canvas.style.width = `${Math.round(canvasWrap.clientWidth * scale)}px`;
-    canvas.style.height = `${Math.round(canvasWrap.clientHeight * scale)}px`;
-  }
+  const layout = fitLayout(
+    { width: canvasWrap.clientWidth, height: canvasWrap.clientHeight },
+    { width: remoteWidth || canvas.width, height: remoteHeight || canvas.height },
+    Number(scaleSelect.value),
+  );
+  if (!layout) return;
+  canvas.style.width = `${layout.width}px`;
+  canvas.style.height = `${layout.height}px`;
+  scaleNotice.hidden = !layout.limited;
+  scaleNotice.textContent = lang() === "zh" ? "放大受限：为完整显示已适应窗口" : "Zoom limited to fit the entire desktop";
 }
 
-scaleSelect.addEventListener("change", () => {
+scaleSelect.addEventListener("change", applyScale);
+window.addEventListener("dbx-plugin-env", applyScale);
+new ResizeObserver(() => {
   applyScale();
-  drawToScreen();
-});
+  scheduleAutoSize();
+  updateDiagnostics();
+}).observe(canvasWrap);
 
 // ---------------------------------------------------------------- input
 
 function toRemotePoint(event: MouseEvent): { x: number; y: number } | null {
   if (!remoteWidth || !remoteHeight) return null;
-  const rect = canvas.getBoundingClientRect();
-  if (rect.width === 0 || rect.height === 0) return null;
-  const x = Math.round(((event.clientX - rect.left) / rect.width) * remoteWidth);
-  const y = Math.round(((event.clientY - rect.top) / rect.height) * remoteHeight);
-  return {
-    x: Math.min(Math.max(x, 0), remoteWidth - 1),
-    y: Math.min(Math.max(y, 0), remoteHeight - 1),
-  };
+  return remotePoint(event.clientX, event.clientY, canvas.getBoundingClientRect(), { width: remoteWidth, height: remoteHeight });
 }
 
 function buttonFlags(event: MouseEvent): number {
@@ -244,6 +263,22 @@ pullFilesBtn.addEventListener("click", () => {
 let lastMoveAt = 0;
 let pendingMove: { x: number; y: number } | null = null;
 let moveTimer: number | undefined;
+function flushPendingMove(): void {
+  if (moveTimer !== undefined) window.clearTimeout(moveTimer);
+  moveTimer = undefined;
+  if (pendingMove) {
+    send(mousePacket(connectionId, PTR_MOVE, pendingMove.x, pendingMove.y));
+    pendingMove = null;
+    lastMoveAt = performance.now();
+  }
+}
+
+function cancelPendingMove(): void {
+  if (moveTimer !== undefined) window.clearTimeout(moveTimer);
+  moveTimer = undefined;
+  pendingMove = null;
+}
+
 function throttledMove(x: number, y: number): void {
   const wait = 16 - (performance.now() - lastMoveAt);
   if (wait <= 0) {
@@ -265,9 +300,31 @@ function throttledMove(x: number, y: number): void {
   }
 }
 
+function releaseRemoteButtons(): void {
+  cancelPendingMove();
+  for (const button of heldButtons) {
+    send(mousePacket(connectionId, button, lastPoint[0], lastPoint[1]));
+  }
+  heldButtons.clear();
+}
+
+function releaseRemoteInputState(): void {
+  releaseRemoteButtons();
+  releaseForwardedKeys();
+}
+
+canvas.addEventListener("focus", () => {
+  canvas.classList.add("remote-focus");
+});
+canvas.addEventListener("blur", () => {
+  canvas.classList.remove("remote-focus");
+  releaseRemoteInputState();
+});
+
 canvas.addEventListener("pointerdown", (event) => {
+  canvas.focus({ preventScroll: true });
   canvas.setPointerCapture(event.pointerId);
-  imeInput.focus({ preventScroll: true });
+  flushPendingMove();
   const point = toRemotePoint(event);
   if (!point) return;
   event.preventDefault();
@@ -277,14 +334,19 @@ canvas.addEventListener("pointerdown", (event) => {
   send(mousePacket(connectionId, PTR_DOWN | button, point.x, point.y));
 });
 
-canvas.addEventListener("pointerup", (event) => {
-  const point = toRemotePoint(event);
-  if (!point) return;
+function releasePointer(event: PointerEvent): void {
+  flushPendingMove();
+  const point = toRemotePoint(event) ?? { x: lastPoint[0], y: lastPoint[1] };
   event.preventDefault();
   const button = buttonFlags(event);
   heldButtons.delete(button);
   send(mousePacket(connectionId, button, point.x, point.y));
-});
+  if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+}
+
+canvas.addEventListener("pointerup", releasePointer);
+canvas.addEventListener("pointercancel", releasePointer);
+canvas.addEventListener("lostpointercapture", releaseRemoteButtons);
 
 canvas.addEventListener("pointermove", (event) => {
   const point = toRemotePoint(event);
@@ -336,22 +398,11 @@ canvas.addEventListener("wheel", (event) => {
   }
 }, { passive: false });
 
-window.addEventListener("blur", () => {
-  for (const button of heldButtons) {
-    send(mousePacket(connectionId, button, lastPoint[0], lastPoint[1]));
-  }
-  heldButtons.clear();
-  // Losing focus swallows the keyup events, so release every forwarded key
-  // here. Otherwise a Ctrl pressed just before an Alt+Tab would stay down on
-  // the remote and turn the next click into a Ctrl+click.
-  releaseForwardedKeys();
-});
-
-let imeComposing = false;
+window.addEventListener("blur", releaseRemoteInputState);
 
 // Physical keys we actually forwarded as a press. A release is only sent for
-// these, so a key pressed before focus (or mid-IME) can never leave the remote
-// stuck holding it down.
+// these, so a key pressed before focus can never leave the remote stuck holding
+// it down.
 const forwardedKeys = new Set<string>();
 
 function releaseForwardedKeys(): void {
@@ -363,9 +414,6 @@ function releaseForwardedKeys(): void {
 }
 
 function sendKey(event: KeyboardEvent, down: boolean): void {
-  if (imeComposing) return;
-  // IME composition arrives as Process; ignore it here.
-  if (event.key === "Process") return;
   const mapped = mapKey(event.code);
   if (!mapped) return;
 
@@ -376,15 +424,9 @@ function sendKey(event: KeyboardEvent, down: boolean): void {
     return;
   }
 
-  // A printable character typed without a chord is delivered by the hidden
-  // input as a Unicode keyboard event; sending the physical key too would
-  // double it. Modifiers and chords (Ctrl+C / Ctrl+V / Ctrl+X / Alt+…) must
-  // travel as physical keys: that is the only form the server turns into a
-  // shortcut, and it is what the remote's own clipboard handling listens for.
-  if (!isModifier(event.code) && event.key.length === 1 && !event.ctrlKey && !event.altKey && !event.metaKey) {
-    return;
-  }
-
+  if (document.activeElement !== canvas) return;
+  // The canvas has no editable local proxy. Physical keys go to the remote
+  // keyboard/layout, so the remote IME owns text input.
   event.preventDefault();
   forwardedKeys.add(event.code);
   send(keyPacket(connectionId, mapped.flags, mapped.scanCode));
@@ -393,34 +435,13 @@ function sendKey(event: KeyboardEvent, down: boolean): void {
 window.addEventListener("keydown", (event) => sendKey(event, true), { capture: true });
 window.addEventListener("keyup", (event) => sendKey(event, false), { capture: true });
 
-// Ctrl+C / Ctrl+V / Ctrl+X are forwarded to the remote as physical keys, so the
-// browser must not *also* act on them locally. Without this the hidden IME
-// field receives the local clipboard on paste and re-sends it as Unicode text
-// on top of the remote's own paste — the text lands twice. Clipboard transfer
-// itself is owned by the sidecar's CLIPRDR channel.
+// Clipboard shortcuts are local unless the remote canvas owns focus. DBX's
+// native clipboard channel remains responsible for actual transfer.
 for (const type of ["copy", "cut", "paste"]) {
-  window.addEventListener(type, (event) => event.preventDefault(), { capture: true });
+  window.addEventListener(type, (event) => {
+    if (document.activeElement === canvas) event.preventDefault();
+  }, { capture: true });
 }
-
-// Chinese/Japanese IME: the hidden input collects composition; committed text
-// goes out as RDP Unicode keyboard events (MS-RDPBCGR 2.2.8.1.2.4.2).
-imeInput.addEventListener("compositionstart", () => { imeComposing = true; });
-imeInput.addEventListener("compositionend", () => { imeComposing = false; });
-imeInput.addEventListener("input", (event) => {
-  // Belt and braces: a paste that somehow still reaches the field has already
-  // been handled remotely.
-  const source = (event as InputEvent).inputType;
-  if (source === "insertFromPaste" || source === "insertFromDrop") return;
-  const text = imeInput.value;
-  imeInput.value = "";
-  if (!text || !connectionId) return;
-  for (const unit of text) {
-    const code = unit.codePointAt(0) ?? 0;
-    if (code > 0xffff) continue;
-    send(unicodePacket(connectionId, 0, code));
-    send(unicodePacket(connectionId, 0x8000, code));
-  }
-});
 
 // Clipboard sync is fully automatic in the sidecar: remote copies land in the
 // local clipboard and local copies are advertised to the server, so the UI has
@@ -441,11 +462,28 @@ function showClipboardToast(message: string): void {
   }, 4000);
 }
 
-function setStatus(state: string, message?: string): void {
-  const showReconnect = state === "reconnecting" || state === "retry-failed" || state === "connection-lost";
+let currentStatus: { state: string; message?: string; attempt?: number } = { state: "disconnected" };
+
+function setStatus(state: string, message?: string, attempt?: number): void {
+  currentStatus = { state, message, attempt };
+  if (state === "resizing" || state === "resize-failed") {
+    reconnectBar.hidden = true;
+    overlay.textContent = state === "resizing" ? t("resizing")
+      : message ? `${t("resizeFailed")}: ${message}` : t("resizeFailed");
+    return;
+  }
+  const showReconnect = state === "reconnecting" || state === "retry-failed" || state === "retry-exhausted" || state === "connection-lost";
   reconnectBar.hidden = !showReconnect;
+  if (showReconnect) {
+    reconnectNote.textContent = (state === "retry-failed" || state === "retry-exhausted") && attempt
+      ? `${t("lost")} (${attempt})`
+      : t("lost");
+    overlay.textContent = "";
+    return;
+  }
   if (state === "connect-failed") {
     gotFrame = false;
+    reconnectNote.textContent = t("connectFailed");
     overlay.textContent = message ? `${t("connectFailed")}: ${message}` : t("connectFailed");
     return;
   }
@@ -453,19 +491,15 @@ function setStatus(state: string, message?: string): void {
     overlay.textContent = "";
     return;
   }
-  if (showReconnect) overlay.textContent = t("lost");
-  else if (state === "connected") overlay.textContent = t("open");
-  else if (state === "connecting") overlay.textContent = t("connecting");
-  else if (state === "disconnected") overlay.textContent = t("noSession");
+  overlay.textContent = state === "connected" ? t("connected")
+    : state === "connecting" ? t("connecting")
+    : state === "disconnected" ? t("noSession") : "";
 }
 
 // ---------------------------------------------------------------- apply size
 
 function canvasSize(): { width: number; height: number } {
-  return {
-    width: Math.min(8192, Math.max(256, Math.round(canvasWrap.clientWidth / 4) * 4)),
-    height: Math.min(8192, Math.max(200, Math.round(canvasWrap.clientHeight / 4) * 4)),
-  };
+  return fitResolution({ width: canvasWrap.clientWidth, height: canvasWrap.clientHeight }, window.devicePixelRatio);
 }
 
 function targetSize(): { width: number; height: number } {
@@ -476,18 +510,56 @@ function targetSize(): { width: number; height: number } {
   return { width, height };
 }
 
-// Only the Apply button changes the remote desktop size. There is deliberately
-// no ResizeObserver auto-negotiation: servers without DisplayControl used to
-// be re-dialed in a loop by it.
+// No repeated resize on later layout changes or framebuffer generations.
+let autoDecision = new AutoSizeDecision();
+let autoSessionId = "";
+let autoTimer: number | undefined;
+let autoEpoch = 0;
+let autoState = "waiting";
+const diagnostics = document.createElement("span");
+diagnostics.className = "resize-diagnostics";
+diagnostics.setAttribute("role", "status");
+scaleNotice.after(diagnostics);
+
+function updateDiagnostics(): void {
+  const size = remoteWidth && remoteHeight ? `${remoteWidth}×${remoteHeight}` : "—";
+  const dpr = Number.isFinite(window.devicePixelRatio) ? window.devicePixelRatio.toFixed(2) : "1.00";
+  const label = lang() === "zh" ? "远程" : "Remote";
+  const states: Record<string, string> = lang() === "zh"
+    ? { waiting: "等待就绪", fixed: "固定尺寸", requested: "已申请", same: "尺寸匹配", unavailable: "自动协商不可用", manual: "手动设置" }
+    : { waiting: "waiting for readiness", fixed: "fixed size", requested: "requested", same: "size matches", unavailable: "automatic sizing unavailable", manual: "manual sizing" };
+  diagnostics.textContent = `${label}: ${size} · DPR ${dpr} · ${states[autoState] ?? states.waiting}`;
+}
+
+function scheduleAutoSize(): void {
+  if (autoTimer !== undefined) window.clearTimeout(autoTimer);
+  const epoch = autoEpoch;
+  autoTimer = window.setTimeout(() => {
+    autoTimer = undefined;
+    if (epoch !== autoEpoch || !gotFrame || !autoSessionId) return;
+    autoDecision.display();
+    const size = autoDecision.decide({ width: canvasWrap.clientWidth, height: canvasWrap.clientHeight }, window.devicePixelRatio, { width: remoteWidth, height: remoteHeight });
+    if (!size) return;
+    autoState = "requested";
+    updateDiagnostics();
+    send(initialSizePacket(connectionId, size.width, size.height, autoSessionId));
+  }, 300);
+}
+
 function sendApply(): void {
   if (!connectionId) return;
+  autoDecision.userApplied();
+  autoState = "manual";
+  updateDiagnostics();
   const size = targetSize();
-  setStatus("connecting");
+  if (size.width !== remoteWidth || size.height !== remoteHeight) setStatus("resizing");
   send(applySizePacket(connectionId, size.width, size.height));
 }
 
 applyBtn.addEventListener("click", sendApply);
-retryBtn.addEventListener("click", sendApply);
+retryBtn.addEventListener("click", () => {
+  if (connectionId) send(retryPacket(connectionId));
+});
 
 // ---------------------------------------------------------------- bootstrap
 
@@ -514,12 +586,18 @@ function applyEnv(): void {
   applyBtn.textContent = t("apply");
   retryBtn.textContent = t("retry");
   fillResolutionOptions();
-  if (!gotFrame) overlay.textContent = connectionId ? t("open") : t("noSession");
+  setStatus(currentStatus.state, currentStatus.message, currentStatus.attempt);
+  updateDiagnostics();
 }
 
+let resizeFrame = 0;
 window.addEventListener("resize", () => {
-  applyScale();
-  drawToScreen();
+  if (resizeFrame) return;
+  resizeFrame = requestAnimationFrame(() => {
+    resizeFrame = 0;
+    applyScale();
+    drawToScreen();
+  });
 });
 
 async function boot(): Promise<void> {
@@ -543,9 +621,21 @@ async function boot(): Promise<void> {
   const offContext = bridge.onContext((context) => {
     const next = String(context?.connectionId ?? "");
     if (next && next !== connectionId) {
+      releaseRemoteInputState();
+      wheelDelta = 0;
+      wheelAxis = null;
       connectionId = next;
+      frameGeneration = 0;
+      remoteWidth = 0;
+      remoteHeight = 0;
       gotFrame = false;
+      autoEpoch++;
+      autoDecision = new AutoSizeDecision();
+      autoSessionId = "";
+      autoState = "waiting";
+      updateDiagnostics();
       setStatus("connecting");
+      send(sessionReadyPacket(connectionId));
     }
   });
   const offEvent = bridge.onEvent(({ method, params }) => {
@@ -555,12 +645,51 @@ async function boot(): Promise<void> {
       state?: string;
       width?: number;
       height?: number;
-      detail?: { attempt?: number; message?: string };
+      generation?: number;
+      resizeAck?: boolean;
+      detail?: { attempt?: number; message?: string; generation?: number; resizeMode?: string; sessionId?: string; accepted?: boolean; reason?: string };
       direction?: string;
     };
     if (detail.connectionId && detail.connectionId !== connectionId) return;
+    if (method === "rdp/status" && ["session-ready", "session-unavailable", "initial-resize-result"].includes(detail.state ?? "") && detail.connectionId !== connectionId) return;
     if (method === "rdp/status" && detail.state) {
-      setStatus(detail.state, detail.detail?.message);
+      if (!["session-ready", "session-unavailable", "initial-resize-result"].includes(detail.state)) {
+        setStatus(detail.state, detail.detail?.message, detail.detail?.attempt);
+      }
+      if (detail.state === "session-ready" && detail.detail?.sessionId &&
+          (detail.detail.resizeMode === "dynamic" || detail.detail.resizeMode === "fixed")) {
+        if (autoSessionId !== detail.detail.sessionId) {
+          // Preserve an early manual apply and any first frame on initial ready.
+          // A later session reusing this connection id must wait for a new frame.
+          if (autoSessionId) {
+            autoEpoch++;
+            gotFrame = false;
+            frameGeneration = 0;
+            autoDecision = new AutoSizeDecision();
+          }
+          autoSessionId = detail.detail.sessionId;
+          autoDecision.sessionReady(detail.detail.resizeMode);
+          if (autoState !== "manual") autoState = detail.detail.resizeMode === "fixed" ? "fixed" : "waiting";
+          updateDiagnostics();
+          if (detail.detail.resizeMode === "dynamic" && gotFrame) scheduleAutoSize();
+        }
+      } else if (detail.state === "session-unavailable") {
+        autoState = "unavailable";
+        updateDiagnostics();
+      } else if (detail.state === "initial-resize-result" && detail.detail?.sessionId === autoSessionId && autoState !== "manual") {
+        autoState = detail.detail.accepted ? "requested" : "unavailable";
+        updateDiagnostics();
+      }
+    }
+    if (method === "rdp/desktop") {
+      if (typeof detail.generation === "number" && detail.generation >= frameGeneration) {
+        if (detail.generation > frameGeneration) {
+          frameGeneration = detail.generation;
+          gotFrame = false;
+          imageCtx.clearRect(0, 0, imageBuffer.width, imageBuffer.height);
+        }
+      }
+      if (detail.resizeAck) setStatus("connected");
     }
     if (method === "rdp/clipboard") {
       const payload = (params ?? {}) as {
@@ -584,6 +713,9 @@ async function boot(): Promise<void> {
       }
     }
   });
+
+  // Subscribe before querying: session-ready can otherwise race registration.
+  send(sessionReadyPacket(connectionId));
 
   window.addEventListener("dbx-plugin-env", () => {
     locale = bridge.locale ?? locale;

@@ -1,8 +1,8 @@
 //! Phase 3 wire codec: desktop frames (sidecar -> UI) and input events (UI -> sidecar).
 //!
 //! Frame layout (big endian, one stdio-framed binary message per tile):
-//!   magic "RDP1"(4) | connIdLen u8 | connectionId | desktopWidth u16 | desktopHeight u16
-//!   | format u8 | x u16 | y u16 | width u16 | height u16 | seq u32 | RGBA bytes
+//!   magic "RDP2"(4) | connIdLen u8 | connectionId | desktopWidth u16 | desktopHeight u16
+//!   | format u8 | x u16 | y u16 | width u16 | height u16 | seq u32 | generation u32 | RGBA bytes
 //!
 //! Input layout (one binary message per event, channel "input"):
 //!   connIdLen u8 | connectionId | kind u8 | payload
@@ -11,7 +11,11 @@
 //!     kind 2 = wheel  : isHorizontal u8 | rotation i16 | x u16 | y u16
 //!     kind 3 = resize : width u16 | height u16
 //!     kind 4 = unicode: flags u16 | code u16  (IME commits / pasted text)
-//!     kind 5 = apply  : width u16 | height u16  (reconnect at this size)
+//!     kind 5 = apply  : width u16 | height u16  (apply this size)
+//!     kind 6 = pull   : no payload (re-arm remote file pull)
+//!     kind 7 = retry  : no payload (retry an exhausted connection)
+//!     kind 8 = initial resize: width u16 | height u16 | sessionIdLen u8 | sessionId
+//!     kind 9 = session-ready query: no payload
 
 pub const FRAME_CHANNEL: &str = "frame";
 pub const INPUT_CHANNEL: &str = "input";
@@ -24,9 +28,9 @@ pub const FORMAT_RGBA32: u8 = 0;
 pub const MAX_TILE_PIXELS: usize = 800_000;
 const MAX_TILE_ROWS: u16 = 512;
 
-/// Bytes consumed before the pixel payload: magic(4)+len(1)+17 header fields.
+/// Bytes consumed before the pixel payload: magic(4)+len(1)+21 header fields.
 const HEADER_BASE: usize = 4 + 1;
-const HEADER_TAIL: usize = 2 + 2 + 1 + 2 + 2 + 2 + 2 + 4; // dw dh fmt x y w h seq
+const HEADER_TAIL: usize = 2 + 2 + 1 + 2 + 2 + 2 + 2 + 4 + 4; // dw dh fmt x y w h seq generation
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrameHead {
@@ -37,6 +41,7 @@ pub struct FrameHead {
     /// (x, y, width, height)
     pub rect: (u16, u16, u16, u16),
     pub seq: u32,
+    pub generation: u32,
     pub pixels_offset: usize,
 }
 
@@ -47,12 +52,13 @@ pub fn encode_frame(
     format: u8,
     rect: (u16, u16, u16, u16),
     seq: u32,
+    generation: u32,
     pixels: &[u8],
 ) -> Vec<u8> {
     let id = connection_id.as_bytes();
     let id_len = id.len().min(u8::MAX as usize) as u8;
     let mut out = Vec::with_capacity(HEADER_BASE + id_len as usize + HEADER_TAIL + pixels.len());
-    out.extend_from_slice(b"RDP1");
+    out.extend_from_slice(b"RDP2");
     out.push(id_len);
     out.extend_from_slice(&id[..id_len as usize]);
     out.extend_from_slice(&desktop_width.to_be_bytes());
@@ -62,6 +68,7 @@ pub fn encode_frame(
         out.extend_from_slice(&value.to_be_bytes());
     }
     out.extend_from_slice(&seq.to_be_bytes());
+    out.extend_from_slice(&generation.to_be_bytes());
     out.extend_from_slice(pixels);
     out
 }
@@ -70,7 +77,7 @@ pub fn parse_header(data: &[u8]) -> Result<FrameHead, String> {
     if data.len() < 5 {
         return Err("frame too short".to_string());
     }
-    if &data[0..4] != b"RDP1" {
+    if &data[0..4] != b"RDP2" {
         return Err("bad frame magic".to_string());
     }
     let id_len = data[4] as usize;
@@ -97,6 +104,8 @@ pub fn parse_header(data: &[u8]) -> Result<FrameHead, String> {
     at += 2;
     let seq = u32::from_be_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]]);
     at += 4;
+    let generation = u32::from_be_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]]);
+    at += 4;
     Ok(FrameHead {
         connection_id,
         desktop_width,
@@ -104,6 +113,7 @@ pub fn parse_header(data: &[u8]) -> Result<FrameHead, String> {
         format,
         rect: (x, y, width, height),
         seq,
+        generation,
         pixels_offset: at,
     })
 }
@@ -147,6 +157,12 @@ pub enum InputKind {
     /// deferred-offer arm + background pull so a folder copy whose server
     /// render arrived late can be fetched with one explicit click.
     PullFiles,
+    /// User explicitly asked to retry an exhausted connection.
+    Retry,
+    /// Handler-only, lifecycle-bound one-time automatic initial resize.
+    InitialResize { width: u16, height: u16, session_id: [u8; 32] },
+    /// Handler-only query, allowing late subscribers to recover session-ready.
+    SessionReadyQuery,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,6 +226,29 @@ pub fn unicode_bytes(connection_id: &str, flags: u16, code: u16) -> Vec<u8> {
     out
 }
 
+/// Handler-only automatic initial resize. The session id is deliberately
+/// carried in the request so a delayed workbench packet cannot resize a newer
+/// lifecycle that reused the same connection id.
+pub fn initial_resize_bytes(connection_id: &str, width: u16, height: u16, session_id: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + connection_id.len() + 1 + 2 + 2 + 1 + 32);
+    push_id(&mut out, connection_id);
+    out.push(8);
+    out.extend_from_slice(&width.to_be_bytes());
+    out.extend_from_slice(&height.to_be_bytes());
+    let id = session_id.as_bytes();
+    out.push(id.len().min(u8::MAX as usize) as u8);
+    out.extend_from_slice(&id[..id.len().min(u8::MAX as usize)]);
+    out
+}
+
+/// Handler-only query for the current lifecycle's session-ready state.
+pub fn session_ready_query_bytes(connection_id: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + connection_id.len());
+    push_id(&mut out, connection_id);
+    out.push(9);
+    out
+}
+
 pub fn parse_input(data: &[u8]) -> Result<InputMessage, String> {
     if data.is_empty() {
         return Err("empty input packet".to_string());
@@ -257,6 +296,26 @@ pub fn parse_input(data: &[u8]) -> Result<InputMessage, String> {
             height: read_u16(2)?,
         },
         6 => InputKind::PullFiles,
+        7 => {
+            if !body.is_empty() {
+                return Err("retry input must not have a payload".to_string());
+            }
+            InputKind::Retry
+        }
+        8 => {
+            if body.len() != 37 || body[4] != 32 || !body[5..].iter().all(u8::is_ascii_hexdigit) {
+                return Err("invalid initial resize payload".to_string());
+            }
+            let mut session_id = [0; 32];
+            session_id.copy_from_slice(&body[5..]);
+            InputKind::InitialResize { width: read_u16(0)?, height: read_u16(2)?, session_id }
+        }
+        9 => {
+            if !body.is_empty() {
+                return Err("session-ready query must not have a payload".to_string());
+            }
+            InputKind::SessionReadyQuery
+        }
         other => return Err(format!("unknown input kind {other}")),
     };
     Ok(InputMessage { connection_id, event })

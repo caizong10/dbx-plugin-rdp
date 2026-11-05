@@ -22,12 +22,8 @@ pub fn dump_svc_chunk(chunk: &[u8]) {
 }
 
 fn enabled() -> bool {
-    // Default ON for this diagnostic build (the packaged sidecar inherits
-    // no shell env): DBX_RDP_CLIP_DUMP=0 disables explicitly.
-    match std::env::var("DBX_RDP_CLIP_DUMP") {
-        Ok(v) => v != "0",
-        Err(_) => true,
-    }
+    // Protocol metadata is written only when explicitly requested.
+    std::env::var("DBX_RDP_CLIP_DUMP").as_deref() == Ok("1")
 }
 
 fn dump_path() -> std::path::PathBuf {

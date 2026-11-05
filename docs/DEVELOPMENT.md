@@ -89,8 +89,8 @@ npx @dbx-app/plugin-cli dev --path . --port 5190
 - `scripts/acceptance-check.mjs`：打包前本地验收清单。
 - `scripts/reconnect-drill.mjs`：断线自动重连演练。
 
-真机验收脚本需要目标 RDP 机器的地址与凭据，请通过参数或环境变量传入；
-仓库内不保存任何真实主机、账号或口令。
+真机验收脚本需要目标 RDP 机器的地址与凭据；命令行参数可能暴露在进程列表或终端历史中，请勿在共享环境传入真实凭据。仓库内不保存任何真实主机、账号或口令。
+剪贴板诊断默认关闭；仅在需要排障时设置 `DBX_RDP_CLIP_DIAG=1` 或 `DBX_RDP_CLIP_DUMP=1`。
 
 ## 测试
 
@@ -111,7 +111,7 @@ cd backend && cargo test --release   # 包含平台策略与文件剪贴板回�
 - 推 tag：额外把所有目标的 `.dbxp` 附加到该 tag 的 GitHub Release。
 
 ```bash
-git tag v0.2.7 && git push origin v0.2.7
+git tag v0.2.8 && git push origin v0.2.8
 ```
 
 ## Windows + GNU 工具链
